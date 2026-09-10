@@ -26,17 +26,23 @@ def save_country_db(db):
     except Exception:
         return False
 
-# 세션 상태에 국가 DB 로드
 if "country_db" not in st.session_state:
     st.session_state.country_db = load_country_db()
 
-# 발주량 산출 함수
+# 발주량 및 PLT 산출 함수
 def calculate_order_quantity(current_stock, production_plan, safety_stock, moq, lot_size):
     required_qty = (production_plan + safety_stock) - current_stock
     if required_qty <= 0:
-        return 0
+        return 0, 0, 0
+    
+    # 1. 최소 발주 수량(MOQ) 방어
     order_qty = max(required_qty, moq)
-    return math.ceil(order_qty / lot_size) * lot_size
+    
+    # 2. PLT/포장 단위(LOT Size) 올림 처리
+    plt_count = math.ceil(order_qty / lot_size)
+    final_order_qty = plt_count * lot_size
+    
+    return final_order_qty, plt_count, required_qty
 
 # 1. XML Spreadsheet 2003 파서
 def parse_xml_spreadsheet(content):
@@ -179,25 +185,29 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 기억된 품목 국가 마스터")
 st.sidebar.caption(f"현재 시스템이 기억 중인 품목: **{len(st.session_state.country_db):,}개**")
 
-# 초기 대량 등록용 업로더 (필요시 1회성)
 with st.sidebar.expander("📥 엑셀로 국가 마스터 대량 추가/갱신"):
-    bulk_country_text = st.text_area("국가 마스터 엑셀 붙여넣기 (품목코드, 조달국)", height=100)
+    bulk_country_text = st.text_area("국가 마스터 엑셀 붙여넣기 (품목코드, 조달국, MOQ, LOT)", height=100)
     if st.button("마스터에 일괄 추가/반영"):
         df_bulk = parse_clipboard_text(bulk_country_text)
         if df_bulk is not None:
             df_bulk.columns = [str(c).strip() for c in df_bulk.columns]
             p_key = next((c for c in df_bulk.columns if any(k in c.replace(" ","") for k in ["품목코드", "품번"])), df_bulk.columns[0])
-            c_key = next((c for c in df_bulk.columns if any(k in c.replace(" ","") for k in ["조달국", "국가"])), df_bulk.columns[-1])
+            c_key = next((c for c in df_bulk.columns if any(k in c.replace(" ","") for k in ["조달국", "국가"])), df_bulk.columns[1])
+            m_key = next((c for c in df_bulk.columns if "MOQ" in c.upper()), None)
+            l_key = next((c for c in df_bulk.columns if any(k in c.upper() for k in ["LOT", "PLT", "포장단위"])), None)
             
             for _, r in df_bulk.iterrows():
                 pn = str(r.get(p_key, "")).strip().upper()
                 ct = str(r.get(c_key, "")).strip()
+                moq_v = int(float(str(r.get(m_key, 0)).replace(",", ""))) if m_key and pd.notna(r.get(m_key)) else 0
+                lot_v = int(float(str(r.get(l_key, 1)).replace(",", ""))) if l_key and pd.notna(r.get(l_key)) else 1
+                
                 if pn and ct:
                     st.session_state.country_db[pn] = {
                         "country": ct,
                         "safety_days": 30 if "인도" in ct else (14 if "중국" in ct else (90 if ("유럽" in ct or "EU" in ct.upper()) else 14)),
-                        "moq": 0,
-                        "lot_size": 1
+                        "moq": moq_v,
+                        "lot_size": max(1, lot_v)
                     }
             save_country_db(st.session_state.country_db)
             st.success("일괄 저장 완료!")
@@ -213,7 +223,7 @@ col_part_no, col_part_name = st.columns([1.2, 2])
 with col_part_no:
     input_part_no = st.text_input(
         "품번 (품목코드) 직접 입력", 
-        placeholder="예: E0056748C01 입력 후 엔터"
+        placeholder="예: E0070198C08 입력 후 엔터"
     ).strip().upper()
 
 stock_info = stock_db.get(input_part_no, {})
@@ -222,11 +232,9 @@ saved_info = st.session_state.country_db.get(input_part_no, {})
 default_name = stock_info.get("name", "")
 default_stock = stock_info.get("current_stock", 0)
 
-# 기억된 국가 우선 조회
 detected_country = saved_info.get("country", "")
 detected_days = saved_info.get("safety_days", 0)
 
-# 기억에 없을 때만 품명 키워드 추정
 if not detected_country and default_name:
     if "인도" in default_name:
         detected_country = "인도"
@@ -318,19 +326,6 @@ with col2:
         step=1, 
         key=f"safety_days_{input_part_no}_{selected_country_option}"
     )
-    
-    # 국가 변경 시 영구 저장 버튼
-    if input_part_no:
-        if st.button("💾 이 품목의 조달국가 영구 저장/수정"):
-            st.session_state.country_db[input_part_no] = {
-                "country": pure_cname,
-                "safety_days": safety_days,
-                "moq": saved_info.get("moq", 0),
-                "lot_size": saved_info.get("lot_size", 1)
-            }
-            save_country_db(st.session_state.country_db)
-            st.success(f"[{input_part_no}]의 조달국가가 '{pure_cname}'({safety_days}일)로 영구 저장되었습니다!")
-            st.rerun()
 
     calc_safety_stock = int(math.ceil(daily_usage * safety_days))
     
@@ -346,37 +341,77 @@ st.markdown("---")
 
 # --- 3구역: 발주 단위 (MOQ/LOT) 및 최종 산출 ---
 st.subheader("3. 협력사 납품 조건 및 발주량 산출")
-default_moq = saved_info.get("moq", 0)
-default_lot = saved_info.get("lot_size", 1)
+
+saved_moq = saved_info.get("moq", 0)
+saved_lot = saved_info.get("lot_size", 1)
 
 moq_col, lot_col = st.columns(2)
 with moq_col:
-    moq = st.number_input("최소 발주 수량 (MOQ)", min_value=0, value=default_moq, step=100, key=f"moq_{input_part_no}")
+    moq = st.number_input("최소 발주 수량 (MOQ)", min_value=0, value=saved_moq, step=100, key=f"moq_{input_part_no}")
 with lot_col:
-    lot_size = st.number_input("포장 단위 (LOT Size)", min_value=1, value=default_lot, step=10, key=f"lot_{input_part_no}")
+    lot_size = st.number_input(
+        "포장 단위 (PLT / LOT 단위)", 
+        min_value=1, 
+        value=max(1, saved_lot), 
+        step=100, 
+        key=f"lot_{input_part_no}",
+        help="파렛트(PLT) 1개당 적재 수량을 입력하면 해당 배수로 올림 발주됩니다."
+    )
+
+# 국가 및 MOQ/LOT까지 함께 영구 저장할 수 있는 기능 제공
+if input_part_no:
+    if st.button("💾 이 품목의 조달국가 및 발주기준(MOQ/LOT) 영구 저장"):
+        st.session_state.country_db[input_part_no] = {
+            "country": pure_cname,
+            "safety_days": safety_days,
+            "moq": moq,
+            "lot_size": lot_size
+        }
+        save_country_db(st.session_state.country_db)
+        st.success(f"[{input_part_no}] 기준 정보(국가: {pure_cname}, MOQ: {moq:,}, LOT: {lot_size:,}) 영구 저장 완료!")
+        st.rerun()
+
+st.write("")
 
 if st.button("🚀 최종 발주량 산출하기", type="primary", use_container_width=True):
     if not input_part_no:
         st.error("⚠️ 품번을 먼저 입력해주세요.")
     else:
-        result = calculate_order_quantity(current_stock, production_plan, safety_stock, moq, lot_size)
+        final_order_qty, plt_count, pure_shortage = calculate_order_quantity(
+            current_stock, production_plan, safety_stock, moq, lot_size
+        )
         display_name = part_name if part_name else "품명 미지정"
         
         st.markdown(f"### 📋 산출 결과: `[{input_part_no}] {display_name}`")
         
         res1, res2, res3, res4 = st.columns(4)
-        pure_shortage = (production_plan + safety_stock) - current_stock
         
         with res1:
-            st.metric(label="설정 안전재고", value=f"{safety_stock:,} 개", help=f"{safety_days}일치 기준")
+            st.metric(label="설정 안전재고", value=f"{safety_stock:,} EA", help=f"{safety_days}일치 기준")
         with res2:
-            st.metric(label="순수 부족 수량", value=f"{max(0, pure_shortage):,} 개")
+            st.metric(label="순수 부족 수량", value=f"{max(0, pure_shortage):,} EA")
         with res3:
-            st.metric(label="적용 MOQ / LOT", value=f"{moq:,} / {lot_size:,}")
+            st.metric(label="적용 MOQ / PLT단위", value=f"{moq:,} / {lot_size:,} EA")
         with res4:
-            st.metric(label="최종 발주 권고 수량", value=f"{result:,} 개")
+            # 실무 요청 형식: 3,000 EA / 3 PLT 발주
+            if final_order_qty > 0:
+                st.metric(
+                    label="최종 발주 권고 수량", 
+                    value=f"{final_order_qty:,} EA", 
+                    delta=f"{plt_count:,} PLT 발주"
+                )
+            else:
+                st.metric(label="최종 발주 권고 수량", value="0 EA", delta="발주 불필요")
             
-        if result == 0:
+        if final_order_qty == 0:
             st.info("💡 현재고가 충분하여 신규 발주가 필요하지 않습니다.")
-        elif result > pure_shortage:
-            st.warning(f"⚠️ MOQ/LOT 단위 올림으로 인해 순수 부족분 대비 **{result - pure_shortage:,.0f}개** 추가 발주됩니다.")
+        else:
+            diff = final_order_qty - pure_shortage
+            if diff > 0:
+                st.warning(
+                    f"📦 **포장 단위 올림 적용 결과:** 순수 부족분은 **{pure_shortage:,} EA**이나, "
+                    f"PLT 포장 규격({lot_size:,} EA/PLT) 및 MOQ 기준에 맞춰 **{final_order_qty:,} EA ({plt_count} PLT)**로 발주 권고합니다. "
+                    f"(여유분 +{diff:,} EA)"
+                )
+            else:
+                st.success(f"🎯 PLT 단위에 딱 맞추어 **{final_order_qty:,} EA ({plt_count} PLT)** 발주를 권고합니다.")
