@@ -3,30 +3,9 @@ import math
 
 # 1. 품번 마스터 데이터베이스 (사내 기준 품번 매핑)
 PART_MASTER = {
-    "BM-1010-A": {
-        "name": "블로워 모터 (Blower Motor Sub-Assy)",
-        "default_moq": 2000,
-        "default_lot": 50,
-        "default_safety": 1000
-    },
-    "SH-2020-B": {
-        "name": "모터 샤프트 (Motor Shaft)",
-        "default_moq": 5000,
-        "default_lot": 500,
-        "default_safety": 1500
-    },
-    "MG-3030-C": {
-        "name": "영구자석 (Ferrite Magnet)",
-        "default_moq": 10000,
-        "default_lot": 1000,
-        "default_safety": 3000
-    },
-    "ST-4040-D": {
-        "name": "스틸 강판 (Steel Sheet Coil)",
-        "default_moq": 1000,
-        "default_lot": 100,
-        "default_safety": 500
-    }
+    "BM-1010-A": {"name": "블로워 모터", "default_moq": 2000, "default_lot": 50, "default_safety": 1000},
+    # ↓ 여기에 새 품번 추가
+    "NEW-9999-Z": {"name": "신규 부품명", "default_moq": 500, "default_lot": 20, "default_safety": 200},
 }
 
 # 발주량 산출 로직
