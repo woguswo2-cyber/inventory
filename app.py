@@ -85,7 +85,6 @@ def load_data_file(file):
 def parse_clipboard_text(text_data):
     if not text_data or not text_data.strip():
         return None
-    # 엑셀에서 복사하면 기본적으로 Tab(\t) 구분자로 들어옴
     try:
         return pd.read_csv(io.StringIO(text_data.strip()), sep="\t")
     except Exception:
@@ -108,7 +107,7 @@ if input_mode == "📋 엑셀 복사/붙여넣기 (보안망 추천)":
     st.sidebar.subheader("1. 재고 데이터 붙여넣기")
     stock_text = st.sidebar.text_area(
         "사외창고 엑셀 복사본 (헤더 포함 Ctrl+C/V)", 
-        placeholder="엑셀에서 헤더(품목코드, 품목명, 재고수량 등)부터 전체 영역을 복사해서 붙여넣으세요.",
+        placeholder="품목코드, 품목명, 재고수량 등의 영역을 복사해서 붙여넣으세요.",
         height=140
     )
     if stock_text:
@@ -120,7 +119,7 @@ if input_mode == "📋 엑셀 복사/붙여넣기 (보안망 추천)":
     st.sidebar.subheader("2. 국가 마스터 붙여넣기")
     country_text = st.sidebar.text_area(
         "국가 마스터 엑셀 복사본 (선택)", 
-        placeholder="품목코드, 조달국가, 안전재고일수, MOQ, LOT 영역 복사/붙여넣기",
+        placeholder="품목코드, 품목명, 조달국(국가) 영역을 복사해서 붙여넣으세요.",
         height=120
     )
     if country_text:
@@ -177,7 +176,7 @@ if df_stock is not None:
             }
     st.sidebar.success(f"✅ 재고 데이터: {len(stock_db):,}개 품목 연동 완료")
 
-# 2) 국가 마스터 DataFrame 매핑
+# 2) 국가 마스터 DataFrame 매핑 ('조달국' 완벽 지원)
 if df_country is not None:
     df_country.columns = [str(c).strip() for c in df_country.columns]
     c_map = {}
@@ -185,7 +184,7 @@ if df_country is not None:
         clean_c = c.replace(" ", "")
         if clean_c in ["품목코드", "품번", "자재코드"]:
             c_map["품번"] = c
-        elif clean_c in ["조달국가", "국가", "원산지", "나라"]:
+        elif clean_c in ["조달국", "조달국가", "국가", "원산지", "나라"]:
             c_map["국가"] = c
         elif "일수" in clean_c or "안전재고" in clean_c:
             c_map["안전재고일수"] = c
@@ -195,7 +194,7 @@ if df_country is not None:
             c_map["LOT"] = c
 
     cp_col = c_map.get("품번", "품목코드")
-    cnt_col = c_map.get("국가", "조달국가")
+    cnt_col = c_map.get("국가", "조달국")
     days_col = c_map.get("안전재고일수", "안전재고일수")
     moq_col = c_map.get("MOQ", "MOQ")
     lot_col = c_map.get("LOT", "LOT")
@@ -211,11 +210,12 @@ if df_country is not None:
             except Exception:
                 pass
             
+            # 마스터 국가명 기준 일수 계산
             if days == 0:
-                if "중국" in country_val:
-                    days = 14
-                elif "인도" in country_val:
+                if "인도" in country_val:
                     days = 30
+                elif "중국" in country_val:
+                    days = 14
                 elif "유럽" in country_val or "EU" in country_val.upper():
                     days = 90
 
@@ -256,9 +256,11 @@ country_info = country_db.get(input_part_no, {})
 default_name = stock_info.get("name", "")
 default_stock = stock_info.get("current_stock", 0)
 
+# [우선순위 1] 마스터에 등록된 국가 확인
 detected_country = country_info.get("country", "")
 detected_days = country_info.get("safety_days", 0)
 
+# [우선순위 2] 마스터에 없을 때만 품명 키워드로 추정
 if not detected_country and default_name:
     if "인도" in default_name:
         detected_country = "인도"
@@ -266,23 +268,25 @@ if not detected_country and default_name:
     elif "중국" in default_name:
         detected_country = "중국"
         detected_days = 14
-    elif "EU" in default_name.upper() or "유럽" in default_name:
+    elif "유럽" in default_name or "EU" in default_name.upper():
         detected_country = "유럽"
         detected_days = 90
 
 country_list = ["중국 (2주 / 14일)", "인도 (1달 / 30일)", "유럽 (3달 / 90일)", "기타 / 직접 지정"]
+
+# 드롭다운 인덱스 결정 (인도 우선 판별)
 if "인도" in detected_country:
     country_default_idx = 1
     base_days = 30
-elif "유럽" in detected_country or "EU" in detected_country.upper():
-    country_default_idx = 2
-    base_days = 90
 elif "중국" in detected_country:
     country_default_idx = 0
     base_days = 14
+elif "유럽" in detected_country or "EU" in detected_country.upper():
+    country_default_idx = 2
+    base_days = 90
 else:
     country_default_idx = 3
-    base_days = detected_days if detected_days > 0 else 14
+    base_days = 14
 
 if detected_days > 0:
     base_days = detected_days
@@ -294,7 +298,7 @@ with col_part_name:
     part_name = st.text_input("품명 (품목명)", value=default_name, disabled=True if default_name else False)
     if input_part_no:
         if stock_info and country_info:
-            st.caption(f"🟢 [연동 완료] 조달국가: **{detected_country}** (기준 일수: **{base_days}일**)")
+            st.caption(f"🟢 [마스터 연동 완료] 조달국가: **{detected_country}** (기준 일수: **{base_days}일**)")
         elif stock_info:
             st.caption(f"🟡 재고 연동 완료 (국가 마스터 미등록 -> 품명 기준 추정: **{detected_country if detected_country else '미지정'}**)")
         else:
@@ -333,10 +337,10 @@ with col2:
         key=f"country_box_{input_part_no}"
     )
     
-    if "중국" in selected_country_option:
-        calc_days = 14
-    elif "인도" in selected_country_option:
+    if "인도" in selected_country_option:
         calc_days = 30
+    elif "중국" in selected_country_option:
+        calc_days = 14
     elif "유럽" in selected_country_option:
         calc_days = 90
     else:
