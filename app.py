@@ -1,14 +1,8 @@
 import streamlit as st
+import pandas as pd
 import math
 
-# 1. 품번 마스터 데이터베이스 (사내 기준 품번 매핑)
-PART_MASTER = {
-    "BM-1010-A": {"name": "블로워 모터", "default_moq": 2000, "default_lot": 50, "default_safety": 1000},
-    # ↓ 여기에 새 품번 추가
-    "NEW-9999-Z": {"name": "신규 부품명", "default_moq": 500, "default_lot": 20, "default_safety": 200},
-}
-
-# 발주량 산출 로직
+# 발주량 산출 함수
 def calculate_order_quantity(current_stock, production_plan, safety_stock, moq, lot_size):
     required_qty = (production_plan + safety_stock) - current_stock
     if required_qty <= 0:
@@ -17,13 +11,48 @@ def calculate_order_quantity(current_stock, production_plan, safety_stock, moq, 
     return math.ceil(order_qty / lot_size) * lot_size
 
 st.set_page_config(page_title="부품/자재 발주량 산출 시스템", layout="wide")
-
 st.title("📦 부품/자재 적정 발주량 산출 시스템")
-st.caption("품번을 직접 입력하면 마스터에 등록된 품명과 기본 발주 조건이 자동으로 연동됩니다.")
+
+# --- 사이드바: 엑셀 파일 업로드 영역 ---
+st.sidebar.header("📁 사내 재고/마스터 엑셀 업로드")
+uploaded_file = st.sidebar.file_uploader(
+    "사내 전산 다운로드 엑셀 (.xlsx, .xls, .csv)", 
+    type=["xlsx", "xls", "csv"]
+)
+
+part_db = {}
+
+if uploaded_file is not None:
+    try:
+        # 파일 형식에 맞춰 읽기
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file)
+
+        # 열 이름 공백 제거
+        df.columns = df.columns.str.strip()
+
+        # 엑셀 데이터를 딕셔너리로 변환 (품번을 Key로 매핑)
+        for _, row in df.iterrows():
+            p_no = str(row.get("품번", "")).strip().upper()
+            if p_no and p_no != "NAN":
+                part_db[p_no] = {
+                    "name": str(row.get("품명", "")).strip(),
+                    "current_stock": int(row.get("현재재고", 0)) if pd.notna(row.get("현재재고")) else 0,
+                    "safety_stock": int(row.get("안전재고", 0)) if pd.notna(row.get("안전재고")) else 0,
+                    "moq": int(row.get("MOQ", 0)) if pd.notna(row.get("MOQ")) else 0,
+                    "lot_size": int(row.get("LOT", 1)) if pd.notna(row.get("LOT")) else 1,
+                }
+        st.sidebar.success(f"✅ 총 {len(part_db):,}개 품목 로드 완료")
+    except Exception as e:
+        st.sidebar.error(f"⚠️ 파일 로드 실패: {e}")
+else:
+    st.sidebar.info("💡 사내 전산에서 받은 엑셀을 업로드하면 품번 검색 시 자동 연동됩니다.")
 
 st.markdown("---")
 
-# --- 1구역: 품번 직접 입력 및 품명 자동 추적 ---
+# --- 1구역: 품번 입력 및 데이터 매칭 ---
 st.subheader("📌 품목 정보 입력")
 
 col_part_no, col_part_name = st.columns([1.2, 2])
@@ -31,22 +60,22 @@ col_part_no, col_part_name = st.columns([1.2, 2])
 with col_part_no:
     input_part_no = st.text_input(
         "품번 (Part No.) 직접 입력", 
-        value="", 
-        placeholder="예: BM-1010-A 입력 후 엔터",
-        help="등록된 예시 품번: BM-1010-A, SH-2020-B, MG-3030-C, ST-4040-D"
-    ).strip().upper()  # 공백 제거 및 대문자 변환
+        placeholder="예: THS0103600 입력 후 엔터"
+    ).strip().upper()
 
-# 입력한 품번이 마스터에 있는지 판별
-is_matched = input_part_no in PART_MASTER
+# 데이터 매칭 확인
+is_matched = input_part_no in part_db
 
 if is_matched:
-    target_data = PART_MASTER[input_part_no]
-    default_name = target_data["name"]
-    default_safety = target_data["default_safety"]
-    default_moq = target_data["default_moq"]
-    default_lot = target_data["default_lot"]
+    item = part_db[input_part_no]
+    default_name = item["name"]
+    default_stock = item["current_stock"]
+    default_safety = item["safety_stock"]
+    default_moq = item["moq"]
+    default_lot = item["lot_size"]
 else:
     default_name = ""
+    default_stock = 0
     default_safety = 0
     default_moq = 0
     default_lot = 1
@@ -54,48 +83,49 @@ else:
 with col_part_name:
     if is_matched:
         part_name = st.text_input("품명 (Part Name)", value=default_name, disabled=True)
-        st.caption("🟢 등록된 품목 마스터 정보를 성공적으로 불러왔습니다.")
+        st.caption("🟢 엑셀 마스터에서 일치하는 품목 정보를 찾았습니다.")
     else:
-        part_name = st.text_input(
-            "품명 (Part Name)", 
-            value="", 
-            placeholder= "신규 품목일 경우 품명을 직접 입력하세요" if input_part_no else "품번을 먼저 입력하세요",
-            disabled=False
-        )
+        part_name = st.text_input("품명 (Part Name)", value="", placeholder="품명을 직접 입력하거나 좌측에서 엑셀을 업로드하세요")
         if input_part_no:
-            st.caption("🟡 미등록 품번입니다. 품명과 발주 조건을 수기로 입력해주세요.")
+            st.caption("🟡 엑셀에 없는 품번이거나 엑셀이 업로드되지 않았습니다.")
 
 st.markdown("---")
 
-# --- 2구역: 수량 및 발주 조건 입력 ---
+# --- 2구역: 수량 및 발주 조건 (엑셀 값으로 자동 세팅) ---
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("1. 재고 및 생산 계획")
-    current_stock = st.number_input("현재 보유 재고", min_value=0, value=1500, step=100)
-    production_plan = st.number_input("생산 소요량 (계획치)", min_value=0, value=5000, step=100)
+    current_stock = st.number_input(
+        "현재 보유 재고 (전산 기준)", 
+        min_value=0, 
+        value=default_stock, 
+        step=10, 
+        key=f"stock_{input_part_no}"
+    )
+    production_plan = st.number_input("생산 소요량 (계획치)", min_value=0, value=0, step=100)
     safety_stock = st.number_input(
-        "안전 재고", 
+        "기준 안전 재고", 
         min_value=0, 
         value=default_safety, 
-        step=100,
-        key=f"safety_{input_part_no}"  # 품번 바뀔 때 기본값 자동 리셋
+        step=10, 
+        key=f"safety_{input_part_no}"
     )
 
 with col2:
-    st.subheader("2. 발주 조건 (협력사 MOQ / LOT)")
+    st.subheader("2. 협력사 납품 조건")
     moq = st.number_input(
         "최소 발주 수량 (MOQ)", 
         min_value=0, 
         value=default_moq, 
-        step=100,
+        step=10, 
         key=f"moq_{input_part_no}"
     )
     lot_size = st.number_input(
         "포장 단위 (LOT Size)", 
         min_value=1, 
-        value=default_lot, 
-        step=10,
+        value=max(1, default_lot), 
+        step=10, 
         key=f"lot_{input_part_no}"
     )
 
@@ -111,17 +141,17 @@ if st.button("🚀 최종 발주량 산출하기", type="primary", use_container
         
         st.markdown(f"### 📋 산출 결과: `[{input_part_no}] {display_name}`")
         
-        res_col1, res_col2, res_col3 = st.columns(3)
+        res1, res2, res3 = st.columns(3)
         pure_shortage = (production_plan + safety_stock) - current_stock
         
-        with res_col1:
+        with res1:
             st.metric(label="순수 부족 수량", value=f"{max(0, pure_shortage):,} 개")
-        with res_col2:
+        with res2:
             st.metric(label="적용 MOQ / LOT", value=f"{moq:,} / {lot_size:,}")
-        with res_col3:
+        with res3:
             st.metric(label="최종 발주 권고 수량", value=f"{result:,} 개")
             
         if result == 0:
-            st.info("💡 현재 재고가 충분하여 발주가 필요하지 않습니다.")
+            st.info("💡 보유 재고로 충당 가능하여 신규 발주가 불필요합니다.")
         elif result > pure_shortage:
-            st.warning(f"⚠️ 협력사 MOQ 또는 LOT 올림 조건으로 인해 부족분 대비 **{result - pure_shortage:,.0f}개** 추가 발주됩니다.")
+            st.warning(f"⚠️ MOQ/LOT 단위 올림으로 인해 부족분 대비 **{result - pure_shortage:,.0f}개** 추가 발주됩니다.")
