@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
 import math
+import io
 
-# 1. 발주량 산출 함수
+# 발주량 산출 함수
 def calculate_order_quantity(current_stock, production_plan, safety_stock, moq, lot_size):
     required_qty = (production_plan + safety_stock) - current_stock
     if required_qty <= 0:
@@ -10,11 +11,47 @@ def calculate_order_quantity(current_stock, production_plan, safety_stock, moq, 
     order_qty = max(required_qty, moq)
     return math.ceil(order_qty / lot_size) * lot_size
 
-# 2. 웹 페이지 설정
+# 파일 판독 함수 (ERP 전산 다운로드 파일 완벽 호환)
+def load_data_file(file):
+    content = file.read()
+    
+    # 1. 일반 바이너리 엑셀(.xlsx) 시도
+    try:
+        return pd.read_excel(io.BytesIO(content), engine="openpyxl")
+    except Exception:
+        pass
+
+    # 2. 구형 바이너리 엑셀(.xls) 시도
+    try:
+        return pd.read_excel(io.BytesIO(content), engine="xlrd")
+    except Exception:
+        pass
+
+    # 3. ERP 전산 특유의 HTML형식 xls 파일 시도 (가장 유력)
+    try:
+        tables = pd.read_html(io.BytesIO(content))
+        if tables:
+            return tables[0]
+    except Exception:
+        pass
+
+    # 4. CSV (utf-8 / cp949) 시도
+    try:
+        return pd.read_csv(io.BytesIO(content), encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        return pd.read_csv(io.BytesIO(content), encoding="cp949")
+    except Exception:
+        pass
+
+    raise ValueError("지원하지 않는 파일 형식이거나 파일이 손상되었습니다.")
+
 st.set_page_config(page_title="부품/자재 발주량 산출 시스템", layout="wide")
 st.title("📦 부품/자재 적정 발주량 산출 시스템")
 
-# 3. 사이드바: 엑셀 파일 업로드
+# 사이드바 파일 업로드
 st.sidebar.header("📁 사내 재고/마스터 엑셀 업로드")
 uploaded_file = st.sidebar.file_uploader(
     "사내 전산 다운로드 엑셀 (.xlsx, .xls, .csv)", 
@@ -23,58 +60,80 @@ uploaded_file = st.sidebar.file_uploader(
 
 part_db = {}
 
-# 4. 엑셀 파일 판독 및 데이터베이스화
 if uploaded_file is not None:
     try:
-        df = None
-        file_name = uploaded_file.name.lower()
-
-        if file_name.endswith(".csv"):
-            try:
-                df = pd.read_csv(uploaded_file, encoding="utf-8")
-            except UnicodeDecodeError:
-                uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file, encoding="cp949")
-        elif file_name.endswith(".xlsx"):
-            df = pd.read_excel(uploaded_file, engine="openpyxl")
-        elif file_name.endswith(".xls"):
-            # 구형 바이너리 xls 시도 -> 실패 시 HTML 텍스트 형식 시도 (ERP 전산 다운로드 호환)
-            try:
-                uploaded_file.seek(0)
-                df = pd.read_excel(uploaded_file, engine="xlrd")
-            except Exception:
-                try:
-                    uploaded_file.seek(0)
-                    df = pd.read_html(uploaded_file)[0]
-                except Exception:
-                    uploaded_file.seek(0)
-                    df = pd.read_excel(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
-
-        # 컬럼 양끝 공백 제거
+        df = load_data_file(uploaded_file)
+        
+        # 첫 번째 행이 헤더가 아니거나 비정상일 경우 보정
         df.columns = [str(c).strip() for c in df.columns]
+        
+        # 컬럼 매핑 (전산마다 다른 헤더 명칭 자동 흡수)
+        col_map = {}
+        for c in df.columns:
+            clean_c = c.replace(" ", "")
+            if "품번" in clean_c or "자재코드" in clean_c or "품목코드" in clean_c:
+                col_map["품번"] = c
+            elif "품명" in clean_c or "자재명" in clean_c or "품목명" in clean_c:
+                col_map["품명"] = c
+            elif "현재고" in clean_c or "재고" in clean_c or "수량" in clean_c:
+                if "품번" not in col_map or col_map["품번"] != c:
+                    col_map["현재재고"] = c
+            elif "안전재고" in clean_c:
+                col_map["안전재고"] = c
+            elif "MOQ" in clean_c.upper() or "최소발주" in clean_c:
+                col_map["MOQ"] = c
+            elif "LOT" in clean_c.upper() or "포장단위" in clean_c:
+                col_map["LOT"] = c
 
-        # 엑셀 데이터 딕셔너리로 매핑
+        p_col = col_map.get("품번", "품번")
+        n_col = col_map.get("품명", "품명")
+        s_col = col_map.get("현재재고", "현재재고")
+        safe_col = col_map.get("안전재고", "안전재고")
+        moq_col = col_map.get("MOQ", "MOQ")
+        lot_col = col_map.get("LOT", "LOT")
+
         for _, row in df.iterrows():
-            p_no = str(row.get("품번", "")).strip().upper()
-            if p_no and p_no != "NAN":
+            p_no = str(row.get(p_col, "")).strip().upper()
+            if p_no and p_no != "NAN" and p_no != "NONE":
+                try:
+                    c_stock = int(float(str(row.get(s_col, 0)).replace(",", "")))
+                except Exception:
+                    c_stock = 0
+                try:
+                    s_stock = int(float(str(row.get(safe_col, 0)).replace(",", "")))
+                except Exception:
+                    s_stock = 0
+                try:
+                    m_qty = int(float(str(row.get(moq_col, 0)).replace(",", "")))
+                except Exception:
+                    m_qty = 0
+                try:
+                    l_size = int(float(str(row.get(lot_col, 1)).replace(",", "")))
+                except Exception:
+                    l_size = 1
+
                 part_db[p_no] = {
-                    "name": str(row.get("품명", "")).strip(),
-                    "current_stock": int(row.get("현재재고", 0)) if pd.notna(row.get("현재재고")) else 0,
-                    "safety_stock": int(row.get("안전재고", 0)) if pd.notna(row.get("안전재고")) else 0,
-                    "moq": int(row.get("MOQ", 0)) if pd.notna(row.get("MOQ")) else 0,
-                    "lot_size": int(row.get("LOT", 1)) if pd.notna(row.get("LOT")) else 1,
+                    "name": str(row.get(n_col, "")).strip(),
+                    "current_stock": c_stock,
+                    "safety_stock": s_stock,
+                    "moq": m_qty,
+                    "lot_size": max(1, l_size),
                 }
-        st.sidebar.success(f"✅ 총 {len(part_db):,}개 품목 로드 완료")
+
+        st.sidebar.success(f"✅ 총 {len(part_db):,}개 품목 데이터 연동 성공")
+        
+        # 인식된 파일의 컬럼 안내
+        with st.sidebar.expander("🔍 인식된 엑셀 컬럼 확인"):
+            st.write(list(df.columns))
+
     except Exception as e:
         st.sidebar.error(f"⚠️ 파일 로드 실패: {e}")
 else:
-    st.sidebar.info("💡 사내 전산에서 받은 엑셀을 업로드하면 품번 검색 시 자동 연동됩니다.")
+    st.sidebar.info("💡 사내 전산 엑셀을 업로드하면 품번 입력 시 재고가 자동 입력됩니다.")
 
 st.markdown("---")
 
-# 5. 품번 입력 영역
+# 1. 품목 정보 입력
 st.subheader("📌 품목 정보 입력")
 
 col_part_no, col_part_name = st.columns([1.2, 2])
@@ -104,15 +163,15 @@ else:
 with col_part_name:
     if is_matched:
         part_name = st.text_input("품명 (Part Name)", value=default_name, disabled=True)
-        st.caption("🟢 엑셀 마스터에서 일치하는 품목 정보를 찾았습니다.")
+        st.caption("🟢 전산 데이터에서 일치하는 품목을 찾았습니다.")
     else:
         part_name = st.text_input("품명 (Part Name)", value="", placeholder="품명을 직접 입력하거나 좌측에서 엑셀을 업로드하세요")
         if input_part_no:
-            st.caption("🟡 엑셀에 없는 품번이거나 엑셀이 업로드되지 않았습니다.")
+            st.caption("🟡 엑셀에 일치하는 품번이 없거나 파일이 업로드되지 않았습니다.")
 
 st.markdown("---")
 
-# 6. 수량 및 발주 조건 영역
+# 2. 수량 및 발주 조건 (엑셀 값으로 자동 세팅)
 col1, col2 = st.columns(2)
 
 with col1:
@@ -152,7 +211,7 @@ with col2:
 
 st.markdown("---")
 
-# 7. 발주량 산출 및 결과 표시
+# 3. 발주량 산출
 if st.button("🚀 최종 발주량 산출하기", type="primary", use_container_width=True):
     if not input_part_no:
         st.error("⚠️ 품번을 먼저 입력해주세요.")
