@@ -12,7 +12,7 @@ def calculate_order_quantity(current_stock, production_plan, safety_stock, moq, 
     order_qty = max(required_qty, moq)
     return math.ceil(order_qty / lot_size) * lot_size
 
-# XML Spreadsheet 2003 전용 파서
+# 1. XML Spreadsheet 2003 파서
 def parse_xml_spreadsheet(content):
     root = ET.fromstring(content)
     ns = ""
@@ -28,7 +28,6 @@ def parse_xml_spreadsheet(content):
                 target_idx = int(idx) - 1
                 while len(row_vals) < target_idx:
                     row_vals.append("")
-            
             data_elem = cell.find(f"{ns}Data")
             row_vals.append(data_elem.text if data_elem is not None and data_elem.text else "")
         if any(v != "" for v in row_vals):
@@ -43,11 +42,9 @@ def parse_xml_spreadsheet(content):
     fixed_body = [r + [""] * (max_len - len(r)) if len(r) < max_len else r[:max_len] for r in body]
     return pd.DataFrame(fixed_body, columns=header)
 
-# 다기능 파일 로더
+# 2. 파일 업로드 로더
 def load_data_file(file):
     content = file.read()
-    
-    # 1. XML 기반 ERP 엑셀 (.xls)
     try:
         df_xml = parse_xml_spreadsheet(content)
         if df_xml is not None and not df_xml.empty:
@@ -55,19 +52,16 @@ def load_data_file(file):
     except Exception:
         pass
 
-    # 2. 신형 엑셀 (.xlsx)
     try:
         return pd.read_excel(io.BytesIO(content), engine="openpyxl")
     except Exception:
         pass
 
-    # 3. 구형 바이너리 (.xls)
     try:
         return pd.read_excel(io.BytesIO(content), engine="xlrd")
     except Exception:
         pass
 
-    # 4. HTML 형식 (.xls)
     try:
         tables = pd.read_html(io.BytesIO(content))
         if tables:
@@ -75,7 +69,6 @@ def load_data_file(file):
     except Exception:
         pass
 
-    # 5. CSV (utf-8 / cp949)
     try:
         return pd.read_csv(io.BytesIO(content), encoding="utf-8")
     except Exception:
@@ -88,128 +81,160 @@ def load_data_file(file):
 
     raise ValueError("지원하지 않는 파일 서식입니다.")
 
+# 3. 엑셀 복사/붙여넣기(클립보드 텍스트) 파서
+def parse_clipboard_text(text_data):
+    if not text_data or not text_data.strip():
+        return None
+    # 엑셀에서 복사하면 기본적으로 Tab(\t) 구분자로 들어옴
+    try:
+        return pd.read_csv(io.StringIO(text_data.strip()), sep="\t")
+    except Exception:
+        return pd.read_csv(io.StringIO(text_data.strip()))
+
 st.set_page_config(page_title="부품/자재 발주량 산출 시스템", layout="wide")
 st.title("📦 부품/자재 적정 발주량 산출 시스템")
 
-# --- 사이드바 파일 업로드 영역 ---
-st.sidebar.header("📁 데이터 파일 업로드")
-
-stock_file = st.sidebar.file_uploader(
-    "1. 사외창고 재고 엑셀 (ERP 다운로드본)", 
-    type=["xlsx", "xls", "csv"],
-    key="stock_uploader"
-)
-
-country_file = st.sidebar.file_uploader(
-    "2. 품목별 국가/기준 마스터 엑셀", 
-    type=["xlsx", "xls", "csv"],
-    key="country_uploader"
-)
+# --- 사이드바 데이터 입력 영역 ---
+st.sidebar.header("📁 데이터 입력 방식 선택")
+input_mode = st.sidebar.radio("입력 방식", ["📋 엑셀 복사/붙여넣기 (보안망 추천)", "📂 파일 직접 업로드"], horizontal=True)
 
 stock_db = {}
 country_db = {}
+df_stock = None
+df_country = None
 
-# 1) 재고 파일 파싱
-if stock_file is not None:
-    try:
-        df_stock = load_data_file(stock_file)
-        df_stock.columns = [str(c).strip() for c in df_stock.columns]
-        
-        col_map = {}
-        for c in df_stock.columns:
-            clean_c = c.replace(" ", "")
-            if clean_c in ["품목코드", "품번", "자재코드"]:
-                col_map["품번"] = c
-            elif clean_c in ["품목명", "품명", "자재명"]:
-                col_map["품명"] = c
-            elif clean_c in ["재고수량", "현재재고", "현재고", "재고"]:
-                col_map["현재재고"] = c
+if input_mode == "📋 엑셀 복사/붙여넣기 (보안망 추천)":
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("1. 재고 데이터 붙여넣기")
+    stock_text = st.sidebar.text_area(
+        "사외창고 엑셀 복사본 (헤더 포함 Ctrl+C/V)", 
+        placeholder="엑셀에서 헤더(품목코드, 품목명, 재고수량 등)부터 전체 영역을 복사해서 붙여넣으세요.",
+        height=140
+    )
+    if stock_text:
+        try:
+            df_stock = parse_clipboard_text(stock_text)
+        except Exception as e:
+            st.sidebar.error(f"재고 데이터 파싱 실패: {e}")
 
-        p_col = col_map.get("품번", "품목코드")
-        n_col = col_map.get("품명", "품목명")
-        s_col = col_map.get("현재재고", "재고수량")
+    st.sidebar.subheader("2. 국가 마스터 붙여넣기")
+    country_text = st.sidebar.text_area(
+        "국가 마스터 엑셀 복사본 (선택)", 
+        placeholder="품목코드, 조달국가, 안전재고일수, MOQ, LOT 영역 복사/붙여넣기",
+        height=120
+    )
+    if country_text:
+        try:
+            df_country = parse_clipboard_text(country_text)
+        except Exception as e:
+            st.sidebar.error(f"국가 마스터 파싱 실패: {e}")
 
-        for _, row in df_stock.iterrows():
-            p_no = str(row.get(p_col, "")).strip().upper()
-            if p_no and p_no not in ["NAN", "NONE", ""]:
-                raw_stock = str(row.get(s_col, 0)).replace(",", "").strip()
-                try:
-                    c_stock = int(float(raw_stock))
-                except Exception:
-                    c_stock = 0
+else:
+    st.sidebar.markdown("---")
+    stock_file = st.sidebar.file_uploader("1. 사외창고 재고 엑셀", type=["xlsx", "xls", "csv"])
+    if stock_file:
+        try:
+            df_stock = load_data_file(stock_file)
+        except Exception as e:
+            st.sidebar.error(f"재고 파일 로드 실패: {e}")
 
-                stock_db[p_no] = {
-                    "name": str(row.get(n_col, "")).strip(),
-                    "current_stock": c_stock
-                }
-        st.sidebar.success(f"✅ 재고 데이터: {len(stock_db):,}개 품목 연동")
-    except Exception as e:
-        st.sidebar.error(f"⚠️ 재고 파일 로드 실패: {e}")
+    country_file = st.sidebar.file_uploader("2. 품목별 국가 마스터 엑셀", type=["xlsx", "xls", "csv"])
+    if country_file:
+        try:
+            df_country = load_data_file(country_file)
+        except Exception as e:
+            st.sidebar.error(f"국가 마스터 로드 실패: {e}")
 
-# 2) 국가 마스터 파일 파싱
-if country_file is not None:
-    try:
-        df_country = load_data_file(country_file)
-        df_country.columns = [str(c).strip() for c in df_country.columns]
-        
-        c_map = {}
-        for c in df_country.columns:
-            clean_c = c.replace(" ", "")
-            if clean_c in ["품목코드", "품번", "자재코드"]:
-                c_map["품번"] = c
-            elif clean_c in ["조달국가", "국가", "원산지", "나라"]:
-                c_map["국가"] = c
-            elif "일수" in clean_c or "안전재고" in clean_c:
-                c_map["안전재고일수"] = c
-            elif "MOQ" in clean_c.upper() or "최소발주" in clean_c:
-                c_map["MOQ"] = c
-            elif "LOT" in clean_c.upper() or "포장단위" in clean_c:
-                c_map["LOT"] = c
+# 1) 재고 DataFrame 매핑
+if df_stock is not None:
+    df_stock.columns = [str(c).strip() for c in df_stock.columns]
+    col_map = {}
+    for c in df_stock.columns:
+        clean_c = c.replace(" ", "")
+        if clean_c in ["품목코드", "품번", "자재코드"]:
+            col_map["품번"] = c
+        elif clean_c in ["품목명", "품명", "자재명"]:
+            col_map["품명"] = c
+        elif clean_c in ["재고수량", "현재재고", "현재고", "재고"]:
+            col_map["현재재고"] = c
 
-        cp_col = c_map.get("품번", "품목코드")
-        cnt_col = c_map.get("국가", "조달국가")
-        days_col = c_map.get("안전재고일수", "안전재고일수")
-        moq_col = c_map.get("MOQ", "MOQ")
-        lot_col = c_map.get("LOT", "LOT")
+    p_col = col_map.get("품번", "품목코드")
+    n_col = col_map.get("품명", "품목명")
+    s_col = col_map.get("현재재고", "재고수량")
 
-        for _, row in df_country.iterrows():
-            p_no = str(row.get(cp_col, "")).strip().upper()
-            if p_no and p_no not in ["NAN", "NONE", ""]:
-                country_val = str(row.get(cnt_col, "")).strip()
-                
-                days = 0
-                try:
-                    days = int(float(str(row.get(days_col, 0)).replace(",", "")))
-                except Exception:
-                    pass
-                
-                # 일수 미기재 시 기본 규칙 자동 부여
-                if days == 0:
-                    if "중국" in country_val:
-                        days = 14
-                    elif "인도" in country_val:
-                        days = 30
-                    elif "유럽" in country_val or "EU" in country_val.upper():
-                        days = 90
+    for _, row in df_stock.iterrows():
+        p_no = str(row.get(p_col, "")).strip().upper()
+        if p_no and p_no not in ["NAN", "NONE", ""]:
+            raw_stock = str(row.get(s_col, 0)).replace(",", "").strip()
+            try:
+                c_stock = int(float(raw_stock))
+            except Exception:
+                c_stock = 0
 
-                try:
-                    m_qty = int(float(str(row.get(moq_col, 0)).replace(",", "")))
-                except Exception:
-                    m_qty = 0
-                try:
-                    l_size = int(float(str(row.get(lot_col, 1)).replace(",", "")))
-                except Exception:
-                    l_size = 1
+            stock_db[p_no] = {
+                "name": str(row.get(n_col, "")).strip(),
+                "current_stock": c_stock
+            }
+    st.sidebar.success(f"✅ 재고 데이터: {len(stock_db):,}개 품목 연동 완료")
 
-                country_db[p_no] = {
-                    "country": country_val,
-                    "safety_days": days,
-                    "moq": m_qty,
-                    "lot_size": max(1, l_size)
-                }
-        st.sidebar.success(f"✅ 국가 마스터: {len(country_db):,}개 품목 연동")
-    except Exception as e:
-        st.sidebar.error(f"⚠️ 국가 마스터 로드 실패: {e}")
+# 2) 국가 마스터 DataFrame 매핑
+if df_country is not None:
+    df_country.columns = [str(c).strip() for c in df_country.columns]
+    c_map = {}
+    for c in df_country.columns:
+        clean_c = c.replace(" ", "")
+        if clean_c in ["품목코드", "품번", "자재코드"]:
+            c_map["품번"] = c
+        elif clean_c in ["조달국가", "국가", "원산지", "나라"]:
+            c_map["국가"] = c
+        elif "일수" in clean_c or "안전재고" in clean_c:
+            c_map["안전재고일수"] = c
+        elif "MOQ" in clean_c.upper() or "최소발주" in clean_c:
+            c_map["MOQ"] = c
+        elif "LOT" in clean_c.upper() or "포장단위" in clean_c:
+            c_map["LOT"] = c
+
+    cp_col = c_map.get("품번", "품목코드")
+    cnt_col = c_map.get("국가", "조달국가")
+    days_col = c_map.get("안전재고일수", "안전재고일수")
+    moq_col = c_map.get("MOQ", "MOQ")
+    lot_col = c_map.get("LOT", "LOT")
+
+    for _, row in df_country.iterrows():
+        p_no = str(row.get(cp_col, "")).strip().upper()
+        if p_no and p_no not in ["NAN", "NONE", ""]:
+            country_val = str(row.get(cnt_col, "")).strip()
+            
+            days = 0
+            try:
+                days = int(float(str(row.get(days_col, 0)).replace(",", "")))
+            except Exception:
+                pass
+            
+            if days == 0:
+                if "중국" in country_val:
+                    days = 14
+                elif "인도" in country_val:
+                    days = 30
+                elif "유럽" in country_val or "EU" in country_val.upper():
+                    days = 90
+
+            try:
+                m_qty = int(float(str(row.get(moq_col, 0)).replace(",", "")))
+            except Exception:
+                m_qty = 0
+            try:
+                l_size = int(float(str(row.get(lot_col, 1)).replace(",", "")))
+            except Exception:
+                l_size = 1
+
+            country_db[p_no] = {
+                "country": country_val,
+                "safety_days": days,
+                "moq": m_qty,
+                "lot_size": max(1, l_size)
+            }
+    st.sidebar.success(f"✅ 국가 마스터: {len(country_db):,}개 품목 연동 완료")
 
 st.markdown("---")
 
@@ -231,11 +256,9 @@ country_info = country_db.get(input_part_no, {})
 default_name = stock_info.get("name", "")
 default_stock = stock_info.get("current_stock", 0)
 
-# 국가 및 일수 판별 로직
 detected_country = country_info.get("country", "")
 detected_days = country_info.get("safety_days", 0)
 
-# 마스터에 없을 때 품명에서 키워드 자동 탐색
 if not detected_country and default_name:
     if "인도" in default_name:
         detected_country = "인도"
@@ -247,7 +270,6 @@ if not detected_country and default_name:
         detected_country = "유럽"
         detected_days = 90
 
-# 드롭다운 인덱스 자동 매칭 (품번에 맞게 바로 전환)
 country_list = ["중국 (2주 / 14일)", "인도 (1달 / 30일)", "유럽 (3달 / 90일)", "기타 / 직접 지정"]
 if "인도" in detected_country:
     country_default_idx = 1
@@ -272,11 +294,11 @@ with col_part_name:
     part_name = st.text_input("품명 (품목명)", value=default_name, disabled=True if default_name else False)
     if input_part_no:
         if stock_info and country_info:
-            st.caption(f"🟢 [연동 성공] 조달국가: **{detected_country}** (기준 일수: **{base_days}일**)")
+            st.caption(f"🟢 [연동 완료] 조달국가: **{detected_country}** (기준 일수: **{base_days}일**)")
         elif stock_info:
             st.caption(f"🟡 재고 연동 완료 (국가 마스터 미등록 -> 품명 기준 추정: **{detected_country if detected_country else '미지정'}**)")
         else:
-            st.caption("🔴 업로드된 재고 파일에 없는 품목코드입니다.")
+            st.caption("🔴 입력된 데이터에서 품목코드를 찾을 수 없습니다.")
 
 st.markdown("---")
 
@@ -304,7 +326,6 @@ with col1:
 
 with col2:
     st.subheader("2. 조달 국가 및 안전재고 자동 설정")
-    # key에 input_part_no를 바인딩하여 품번 변경 시 선택 상태를 즉시 재계산
     selected_country_option = st.selectbox(
         "조달 국가 선택 (품번 입력 시 자동 선택)", 
         country_list, 
@@ -312,7 +333,6 @@ with col2:
         key=f"country_box_{input_part_no}"
     )
     
-    # 드롭다운 직접 바꿨을 때 일수 자동 연동
     if "중국" in selected_country_option:
         calc_days = 14
     elif "인도" in selected_country_option:
@@ -330,7 +350,6 @@ with col2:
         key=f"safety_days_{input_part_no}_{selected_country_option}"
     )
     
-    # 일 소요량 x 적용 일수
     calc_safety_stock = int(math.ceil(daily_usage * safety_days))
     
     safety_stock = st.number_input(
