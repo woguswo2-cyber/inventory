@@ -94,14 +94,12 @@ st.title("📦 부품/자재 적정 발주량 산출 시스템")
 # --- 사이드바 파일 업로드 영역 ---
 st.sidebar.header("📁 데이터 파일 업로드")
 
-# 1. 사외창고 재고 파일 업로드
 stock_file = st.sidebar.file_uploader(
     "1. 사외창고 재고 엑셀 (ERP 다운로드본)", 
     type=["xlsx", "xls", "csv"],
     key="stock_uploader"
 )
 
-# 2. 국가/기준 마스터 파일 업로드
 country_file = st.sidebar.file_uploader(
     "2. 품목별 국가/기준 마스터 엑셀", 
     type=["xlsx", "xls", "csv"],
@@ -179,13 +177,13 @@ if country_file is not None:
             if p_no and p_no not in ["NAN", "NONE", ""]:
                 country_val = str(row.get(cnt_col, "")).strip()
                 
-                # 안전재고 일수 자동 판별 (기본값: 중국 14일, 인도 30일, 유럽 90일)
                 days = 0
                 try:
                     days = int(float(str(row.get(days_col, 0)).replace(",", "")))
                 except Exception:
                     pass
                 
+                # 일수 미기재 시 기본 규칙 자동 부여
                 if days == 0:
                     if "중국" in country_val:
                         days = 14
@@ -215,7 +213,7 @@ if country_file is not None:
 
 st.markdown("---")
 
-# --- 1구역: 품목 정보 입력 ---
+# --- 1구역: 품목 정보 조회 ---
 st.subheader("📌 품목 정보 조회")
 
 col_part_no, col_part_name = st.columns([1.2, 2])
@@ -223,7 +221,7 @@ col_part_no, col_part_name = st.columns([1.2, 2])
 with col_part_no:
     input_part_no = st.text_input(
         "품번 (품목코드) 직접 입력", 
-        placeholder="예: E0056748 또는 H0020650"
+        placeholder="예: E0056748C01 입력 후 엔터"
     ).strip().upper()
 
 # 데이터 조회
@@ -233,10 +231,11 @@ country_info = country_db.get(input_part_no, {})
 default_name = stock_info.get("name", "")
 default_stock = stock_info.get("current_stock", 0)
 
-# 국가 기본값 판별 (1순위: 마스터, 2순위: 품명 키워드 검색)
+# 국가 및 일수 판별 로직
 detected_country = country_info.get("country", "")
 detected_days = country_info.get("safety_days", 0)
 
+# 마스터에 없을 때 품명에서 키워드 자동 탐색
 if not detected_country and default_name:
     if "인도" in default_name:
         detected_country = "인도"
@@ -248,12 +247,23 @@ if not detected_country and default_name:
         detected_country = "유럽"
         detected_days = 90
 
+# 드롭다운 인덱스 자동 매칭 (품번에 맞게 바로 전환)
 country_list = ["중국 (2주 / 14일)", "인도 (1달 / 30일)", "유럽 (3달 / 90일)", "기타 / 직접 지정"]
-country_default_idx = 0
 if "인도" in detected_country:
     country_default_idx = 1
+    base_days = 30
 elif "유럽" in detected_country or "EU" in detected_country.upper():
     country_default_idx = 2
+    base_days = 90
+elif "중국" in detected_country:
+    country_default_idx = 0
+    base_days = 14
+else:
+    country_default_idx = 3
+    base_days = detected_days if detected_days > 0 else 14
+
+if detected_days > 0:
+    base_days = detected_days
 
 default_moq = country_info.get("moq", 0)
 default_lot = country_info.get("lot_size", 1)
@@ -262,11 +272,11 @@ with col_part_name:
     part_name = st.text_input("품명 (품목명)", value=default_name, disabled=True if default_name else False)
     if input_part_no:
         if stock_info and country_info:
-            st.caption(f"🟢 [재고 연동 완료] | 조달국가: **{detected_country}** (안전재고 기준: **{detected_days}일**)")
+            st.caption(f"🟢 [연동 성공] 조달국가: **{detected_country}** (기준 일수: **{base_days}일**)")
         elif stock_info:
-            st.caption(f"🟡 재고는 확인되었으나 국가 마스터에 미등록된 품목입니다. (추정: **{detected_country if detected_country else '미지정'}**)")
+            st.caption(f"🟡 재고 연동 완료 (국가 마스터 미등록 -> 품명 기준 추정: **{detected_country if detected_country else '미지정'}**)")
         else:
-            st.caption("🔴 업로드된 재고 파일에서 품목코드를 찾을 수 없습니다.")
+            st.caption("🔴 업로드된 재고 파일에 없는 품목코드입니다.")
 
 st.markdown("---")
 
@@ -284,40 +294,47 @@ with col1:
     
     plan_type = st.radio("소요량 입력 기준", ["월간 생산 소요량 기준", "일일 소요량 기준"], horizontal=True)
     if plan_type == "월간 생산 소요량 기준":
-        monthly_plan = st.number_input("월간 생산 소요량 (월 계획치)", min_value=0, value=0, step=500)
+        monthly_plan = st.number_input("월간 생산 소요량 (월 계획치)", min_value=0, value=0, step=500, key=f"month_plan_{input_part_no}")
         daily_usage = monthly_plan / 30.0
         production_plan = monthly_plan
     else:
-        daily_usage_input = st.number_input("일일 소요량", min_value=0.0, value=0.0, step=10.0)
+        daily_usage_input = st.number_input("일일 소요량", min_value=0.0, value=0.0, step=10.0, key=f"daily_plan_{input_part_no}")
         daily_usage = daily_usage_input
         production_plan = int(daily_usage * 30)
 
 with col2:
-    st.subheader("2. 조달 국가 및 안전재고 설정")
+    st.subheader("2. 조달 국가 및 안전재고 자동 설정")
+    # key에 input_part_no를 바인딩하여 품번 변경 시 선택 상태를 즉시 재계산
     selected_country_option = st.selectbox(
-        "조달 국가 선택", 
+        "조달 국가 선택 (품번 입력 시 자동 선택)", 
         country_list, 
         index=country_default_idx,
-        key=f"country_sel_{input_part_no}"
+        key=f"country_box_{input_part_no}"
     )
     
-    # 일수 세팅
+    # 드롭다운 직접 바꿨을 때 일수 자동 연동
     if "중국" in selected_country_option:
-        base_days = 14
+        calc_days = 14
     elif "인도" in selected_country_option:
-        base_days = 30
+        calc_days = 30
     elif "유럽" in selected_country_option:
-        base_days = 90
+        calc_days = 90
     else:
-        base_days = detected_days if detected_days > 0 else 14
+        calc_days = base_days
         
-    safety_days = st.number_input("안전재고 적용 일수 (일)", min_value=0, value=base_days, step=1)
+    safety_days = st.number_input(
+        "안전재고 적용 일수 (일)", 
+        min_value=0, 
+        value=calc_days, 
+        step=1, 
+        key=f"safety_days_{input_part_no}_{selected_country_option}"
+    )
     
-    # 일일 소요량 기반 안전재고 자동 계산
+    # 일 소요량 x 적용 일수
     calc_safety_stock = int(math.ceil(daily_usage * safety_days))
     
     safety_stock = st.number_input(
-        f"최종 안전 재고 수량 ({safety_days}일치 자동 계산됨)", 
+        f"최종 안전 재고 수량 ({safety_days}일치 자동 계산)", 
         min_value=0, 
         value=calc_safety_stock, 
         step=50,
