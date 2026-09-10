@@ -2,7 +2,33 @@ import streamlit as st
 import pandas as pd
 import math
 import io
+import json
+import os
 import xml.etree.ElementTree as ET
+
+DB_FILE = "country_master.json"
+
+# 영구 저장용 마스터 데이터 로드/저장 함수
+def load_country_db():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_country_db(db):
+    try:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+# 세션 상태에 국가 DB 로드
+if "country_db" not in st.session_state:
+    st.session_state.country_db = load_country_db()
 
 # 발주량 산출 함수
 def calculate_order_quantity(current_stock, production_plan, safety_stock, moq, lot_size):
@@ -51,37 +77,31 @@ def load_data_file(file):
             return df_xml
     except Exception:
         pass
-
     try:
         return pd.read_excel(io.BytesIO(content), engine="openpyxl")
     except Exception:
         pass
-
     try:
         return pd.read_excel(io.BytesIO(content), engine="xlrd")
     except Exception:
         pass
-
     try:
         tables = pd.read_html(io.BytesIO(content))
         if tables:
             return tables[0]
     except Exception:
         pass
-
     try:
         return pd.read_csv(io.BytesIO(content), encoding="utf-8")
     except Exception:
         pass
-
     try:
         return pd.read_csv(io.BytesIO(content), encoding="cp949")
     except Exception:
         pass
-
     raise ValueError("지원하지 않는 파일 서식입니다.")
 
-# 3. 엑셀 복사/붙여넣기(클립보드 텍스트) 파서
+# 3. 엑셀 복사/붙여넣기 파서
 def parse_clipboard_text(text_data):
     if not text_data or not text_data.strip():
         return None
@@ -94,57 +114,35 @@ st.set_page_config(page_title="부품/자재 발주량 산출 시스템", layout
 st.title("📦 부품/자재 적정 발주량 산출 시스템")
 
 # --- 사이드바 데이터 입력 영역 ---
-st.sidebar.header("📁 데이터 입력 방식 선택")
+st.sidebar.header("📁 데이터 입력 방식")
 input_mode = st.sidebar.radio("입력 방식", ["📋 엑셀 복사/붙여넣기 (보안망 추천)", "📂 파일 직접 업로드"], horizontal=True)
 
 stock_db = {}
-country_db = {}
 df_stock = None
-df_country = None
 
 if input_mode == "📋 엑셀 복사/붙여넣기 (보안망 추천)":
     st.sidebar.markdown("---")
-    st.sidebar.subheader("1. 재고 데이터 붙여넣기")
+    st.sidebar.subheader("재고 데이터 붙여넣기")
     stock_text = st.sidebar.text_area(
         "사외창고 엑셀 복사본 (헤더 포함 Ctrl+C/V)", 
         placeholder="품목코드, 품목명, 재고수량 등의 영역을 복사해서 붙여넣으세요.",
-        height=140
+        height=180
     )
     if stock_text:
         try:
             df_stock = parse_clipboard_text(stock_text)
         except Exception as e:
             st.sidebar.error(f"재고 데이터 파싱 실패: {e}")
-
-    st.sidebar.subheader("2. 국가 마스터 붙여넣기")
-    country_text = st.sidebar.text_area(
-        "국가 마스터 엑셀 복사본 (선택)", 
-        placeholder="품목코드, 품목명, 조달국(국가) 영역을 복사해서 붙여넣으세요.",
-        height=120
-    )
-    if country_text:
-        try:
-            df_country = parse_clipboard_text(country_text)
-        except Exception as e:
-            st.sidebar.error(f"국가 마스터 파싱 실패: {e}")
-
 else:
     st.sidebar.markdown("---")
-    stock_file = st.sidebar.file_uploader("1. 사외창고 재고 엑셀", type=["xlsx", "xls", "csv"])
+    stock_file = st.sidebar.file_uploader("사외창고 재고 엑셀 업로드", type=["xlsx", "xls", "csv"])
     if stock_file:
         try:
             df_stock = load_data_file(stock_file)
         except Exception as e:
             st.sidebar.error(f"재고 파일 로드 실패: {e}")
 
-    country_file = st.sidebar.file_uploader("2. 품목별 국가 마스터 엑셀", type=["xlsx", "xls", "csv"])
-    if country_file:
-        try:
-            df_country = load_data_file(country_file)
-        except Exception as e:
-            st.sidebar.error(f"국가 마스터 로드 실패: {e}")
-
-# 1) 재고 DataFrame 매핑
+# 재고 DataFrame 매핑
 if df_stock is not None:
     df_stock.columns = [str(c).strip() for c in df_stock.columns]
     col_map = {}
@@ -174,67 +172,36 @@ if df_stock is not None:
                 "name": str(row.get(n_col, "")).strip(),
                 "current_stock": c_stock
             }
-    st.sidebar.success(f"✅ 재고 데이터: {len(stock_db):,}개 품목 연동 완료")
+    st.sidebar.success(f"✅ 재고 연동 완료: {len(stock_db):,}개 품목")
 
-# 2) 국가 마스터 DataFrame 매핑 ('조달국' 완벽 지원)
-if df_country is not None:
-    df_country.columns = [str(c).strip() for c in df_country.columns]
-    c_map = {}
-    for c in df_country.columns:
-        clean_c = c.replace(" ", "")
-        if clean_c in ["품목코드", "품번", "자재코드"]:
-            c_map["품번"] = c
-        elif clean_c in ["조달국", "조달국가", "국가", "원산지", "나라"]:
-            c_map["국가"] = c
-        elif "일수" in clean_c or "안전재고" in clean_c:
-            c_map["안전재고일수"] = c
-        elif "MOQ" in clean_c.upper() or "최소발주" in clean_c:
-            c_map["MOQ"] = c
-        elif "LOT" in clean_c.upper() or "포장단위" in clean_c:
-            c_map["LOT"] = c
+# 사이드바: 기억된 국가 DB 현황
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧠 기억된 품목 국가 마스터")
+st.sidebar.caption(f"현재 시스템이 기억 중인 품목: **{len(st.session_state.country_db):,}개**")
 
-    cp_col = c_map.get("품번", "품목코드")
-    cnt_col = c_map.get("국가", "조달국")
-    days_col = c_map.get("안전재고일수", "안전재고일수")
-    moq_col = c_map.get("MOQ", "MOQ")
-    lot_col = c_map.get("LOT", "LOT")
-
-    for _, row in df_country.iterrows():
-        p_no = str(row.get(cp_col, "")).strip().upper()
-        if p_no and p_no not in ["NAN", "NONE", ""]:
-            country_val = str(row.get(cnt_col, "")).strip()
+# 초기 대량 등록용 업로더 (필요시 1회성)
+with st.sidebar.expander("📥 엑셀로 국가 마스터 대량 추가/갱신"):
+    bulk_country_text = st.text_area("국가 마스터 엑셀 붙여넣기 (품목코드, 조달국)", height=100)
+    if st.button("마스터에 일괄 추가/반영"):
+        df_bulk = parse_clipboard_text(bulk_country_text)
+        if df_bulk is not None:
+            df_bulk.columns = [str(c).strip() for c in df_bulk.columns]
+            p_key = next((c for c in df_bulk.columns if any(k in c.replace(" ","") for k in ["품목코드", "품번"])), df_bulk.columns[0])
+            c_key = next((c for c in df_bulk.columns if any(k in c.replace(" ","") for k in ["조달국", "국가"])), df_bulk.columns[-1])
             
-            days = 0
-            try:
-                days = int(float(str(row.get(days_col, 0)).replace(",", "")))
-            except Exception:
-                pass
-            
-            # 마스터 국가명 기준 일수 계산
-            if days == 0:
-                if "인도" in country_val:
-                    days = 30
-                elif "중국" in country_val:
-                    days = 14
-                elif "유럽" in country_val or "EU" in country_val.upper():
-                    days = 90
-
-            try:
-                m_qty = int(float(str(row.get(moq_col, 0)).replace(",", "")))
-            except Exception:
-                m_qty = 0
-            try:
-                l_size = int(float(str(row.get(lot_col, 1)).replace(",", "")))
-            except Exception:
-                l_size = 1
-
-            country_db[p_no] = {
-                "country": country_val,
-                "safety_days": days,
-                "moq": m_qty,
-                "lot_size": max(1, l_size)
-            }
-    st.sidebar.success(f"✅ 국가 마스터: {len(country_db):,}개 품목 연동 완료")
+            for _, r in df_bulk.iterrows():
+                pn = str(r.get(p_key, "")).strip().upper()
+                ct = str(r.get(c_key, "")).strip()
+                if pn and ct:
+                    st.session_state.country_db[pn] = {
+                        "country": ct,
+                        "safety_days": 30 if "인도" in ct else (14 if "중국" in ct else (90 if ("유럽" in ct or "EU" in ct.upper()) else 14)),
+                        "moq": 0,
+                        "lot_size": 1
+                    }
+            save_country_db(st.session_state.country_db)
+            st.success("일괄 저장 완료!")
+            st.rerun()
 
 st.markdown("---")
 
@@ -249,18 +216,17 @@ with col_part_no:
         placeholder="예: E0056748C01 입력 후 엔터"
     ).strip().upper()
 
-# 데이터 조회
 stock_info = stock_db.get(input_part_no, {})
-country_info = country_db.get(input_part_no, {})
+saved_info = st.session_state.country_db.get(input_part_no, {})
 
 default_name = stock_info.get("name", "")
 default_stock = stock_info.get("current_stock", 0)
 
-# [우선순위 1] 마스터에 등록된 국가 확인
-detected_country = country_info.get("country", "")
-detected_days = country_info.get("safety_days", 0)
+# 기억된 국가 우선 조회
+detected_country = saved_info.get("country", "")
+detected_days = saved_info.get("safety_days", 0)
 
-# [우선순위 2] 마스터에 없을 때만 품명 키워드로 추정
+# 기억에 없을 때만 품명 키워드 추정
 if not detected_country and default_name:
     if "인도" in default_name:
         detected_country = "인도"
@@ -273,8 +239,6 @@ if not detected_country and default_name:
         detected_days = 90
 
 country_list = ["중국 (2주 / 14일)", "인도 (1달 / 30일)", "유럽 (3달 / 90일)", "기타 / 직접 지정"]
-
-# 드롭다운 인덱스 결정 (인도 우선 판별)
 if "인도" in detected_country:
     country_default_idx = 1
     base_days = 30
@@ -291,16 +255,13 @@ else:
 if detected_days > 0:
     base_days = detected_days
 
-default_moq = country_info.get("moq", 0)
-default_lot = country_info.get("lot_size", 1)
-
 with col_part_name:
     part_name = st.text_input("품명 (품목명)", value=default_name, disabled=True if default_name else False)
     if input_part_no:
-        if stock_info and country_info:
-            st.caption(f"🟢 [마스터 연동 완료] 조달국가: **{detected_country}** (기준 일수: **{base_days}일**)")
-        elif stock_info:
-            st.caption(f"🟡 재고 연동 완료 (국가 마스터 미등록 -> 품명 기준 추정: **{detected_country if detected_country else '미지정'}**)")
+        if input_part_no in st.session_state.country_db:
+            st.caption(f"🧠 [시스템 기억 정보] 조달국가: **{detected_country}** (기준 일수: **{base_days}일**)")
+        elif default_name:
+            st.caption(f"💡 신규 품목 추정: **{detected_country if detected_country else '미지정'}** (아래에서 수정 후 저장 가능)")
         else:
             st.caption("🔴 입력된 데이터에서 품목코드를 찾을 수 없습니다.")
 
@@ -329,9 +290,9 @@ with col1:
         production_plan = int(daily_usage * 30)
 
 with col2:
-    st.subheader("2. 조달 국가 및 안전재고 자동 설정")
+    st.subheader("2. 조달 국가 및 안전재고 설정")
     selected_country_option = st.selectbox(
-        "조달 국가 선택 (품번 입력 시 자동 선택)", 
+        "조달 국가 선택 (품번 입력 시 자동 세팅)", 
         country_list, 
         index=country_default_idx,
         key=f"country_box_{input_part_no}"
@@ -339,12 +300,16 @@ with col2:
     
     if "인도" in selected_country_option:
         calc_days = 30
+        pure_cname = "인도"
     elif "중국" in selected_country_option:
         calc_days = 14
+        pure_cname = "중국"
     elif "유럽" in selected_country_option:
         calc_days = 90
+        pure_cname = "유럽"
     else:
         calc_days = base_days
+        pure_cname = "기타"
         
     safety_days = st.number_input(
         "안전재고 적용 일수 (일)", 
@@ -354,6 +319,19 @@ with col2:
         key=f"safety_days_{input_part_no}_{selected_country_option}"
     )
     
+    # 국가 변경 시 영구 저장 버튼
+    if input_part_no:
+        if st.button("💾 이 품목의 조달국가 영구 저장/수정"):
+            st.session_state.country_db[input_part_no] = {
+                "country": pure_cname,
+                "safety_days": safety_days,
+                "moq": saved_info.get("moq", 0),
+                "lot_size": saved_info.get("lot_size", 1)
+            }
+            save_country_db(st.session_state.country_db)
+            st.success(f"[{input_part_no}]의 조달국가가 '{pure_cname}'({safety_days}일)로 영구 저장되었습니다!")
+            st.rerun()
+
     calc_safety_stock = int(math.ceil(daily_usage * safety_days))
     
     safety_stock = st.number_input(
@@ -368,6 +346,9 @@ st.markdown("---")
 
 # --- 3구역: 발주 단위 (MOQ/LOT) 및 최종 산출 ---
 st.subheader("3. 협력사 납품 조건 및 발주량 산출")
+default_moq = saved_info.get("moq", 0)
+default_lot = saved_info.get("lot_size", 1)
+
 moq_col, lot_col = st.columns(2)
 with moq_col:
     moq = st.number_input("최소 발주 수량 (MOQ)", min_value=0, value=default_moq, step=100, key=f"moq_{input_part_no}")
