@@ -29,24 +29,27 @@ def save_country_db(db):
 if "country_db" not in st.session_state:
     st.session_state.country_db = load_country_db()
 
-# 발주량 및 PLT 산출 함수
-def calculate_order_quantity(current_stock, production_plan, safety_stock, moq, plt_pack_qty):
+# 발주량 및 PLT 산출 핵심 함수
+def calculate_order_logic(current_stock, production_plan, safety_stock, moq, plt_pack_qty):
+    # 1. 순수 부족 수량 (EA)
     required_qty = (production_plan + safety_stock) - current_stock
     if required_qty <= 0:
-        return 0, 0, 0
+        return 0, 0, 0, 0, 0
     
-    # 1. 최소 발주 수량(MOQ) 1차 보정
+    # 2. MOQ 반영 수량 (EA)
     base_qty = max(required_qty, moq)
     
-    # 2. 파레트 포장 수량(PLT당 수량) 기준 올림 계산
+    # 3. PLT 포장단위 올림 계산
     if plt_pack_qty > 1:
-        plt_count = math.ceil(base_qty / plt_pack_qty)
-        final_order_qty = plt_count * plt_pack_qty
+        exact_plt = base_qty / plt_pack_qty  # 예: 63.77 PLT
+        final_plt = math.ceil(exact_plt)      # 예: 64 PLT
+        final_order_ea = final_plt * plt_pack_qty  # 예: 64 * 2350 = 150,400 EA
     else:
-        plt_count = base_qty
-        final_order_qty = base_qty
+        exact_plt = base_qty
+        final_plt = base_qty
+        final_order_ea = base_qty
         
-    return final_order_qty, plt_count, required_qty
+    return final_order_ea, final_plt, exact_plt, required_qty, base_qty
 
 # 1. XML Spreadsheet 2003 파서
 def parse_xml_spreadsheet(content):
@@ -123,7 +126,7 @@ def parse_clipboard_text(text_data):
 st.set_page_config(page_title="부품/자재 발주량 산출 시스템", layout="wide")
 st.title("📦 부품/자재 적정 발주량 산출 시스템")
 
-# --- 사이드바 데이터 입력 영역 ---
+# --- 사이드바 ---
 st.sidebar.header("📁 데이터 입력 방식")
 input_mode = st.sidebar.radio("입력 방식", ["📋 엑셀 복사/붙여넣기 (보안망 추천)", "📂 파일 직접 업로드"], horizontal=True)
 
@@ -184,34 +187,33 @@ if df_stock is not None:
             }
     st.sidebar.success(f"✅ 재고 연동 완료: {len(stock_db):,}개 품목")
 
-# 사이드바: 기억된 국가 DB 현황
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧠 기억된 품목 기준 마스터")
 st.sidebar.caption(f"현재 시스템이 기억 중인 품목: **{len(st.session_state.country_db):,}개**")
 
 with st.sidebar.expander("📥 엑셀로 기준 마스터 대량 추가/갱신"):
-    bulk_country_text = st.text_area("품목코드, 조달국, MOQ, 파레트포장수량", height=100)
+    bulk_country_text = st.text_area("품목코드, 조달국, PLT포장수량, MOQ 붙여넣기", height=100)
     if st.button("마스터에 일괄 추가/반영"):
         df_bulk = parse_clipboard_text(bulk_country_text)
         if df_bulk is not None:
             df_bulk.columns = [str(c).strip() for c in df_bulk.columns]
             p_key = next((c for c in df_bulk.columns if any(k in c.replace(" ","") for k in ["품목코드", "품번"])), df_bulk.columns[0])
             c_key = next((c for c in df_bulk.columns if any(k in c.replace(" ","") for k in ["조달국", "국가"])), df_bulk.columns[1])
-            m_key = next((c for c in df_bulk.columns if "MOQ" in c.upper()), None)
             l_key = next((c for c in df_bulk.columns if any(k in c.upper() for k in ["PLT", "파레트", "포장단위", "LOT"])), None)
+            m_key = next((c for c in df_bulk.columns if "MOQ" in c.upper()), None)
             
             for _, r in df_bulk.iterrows():
                 pn = str(r.get(p_key, "")).strip().upper()
                 ct = str(r.get(c_key, "")).strip()
-                moq_v = int(float(str(r.get(m_key, 0)).replace(",", ""))) if m_key and pd.notna(r.get(m_key)) else 0
                 lot_v = int(float(str(r.get(l_key, 1)).replace(",", ""))) if l_key and pd.notna(r.get(l_key)) else 1
+                moq_v = int(float(str(r.get(m_key, 0)).replace(",", ""))) if m_key and pd.notna(r.get(m_key)) else 0
                 
                 if pn and ct:
                     st.session_state.country_db[pn] = {
                         "country": ct,
                         "safety_days": 30 if "인도" in ct else (14 if "중국" in ct else (90 if ("유럽" in ct or "EU" in ct.upper()) else 14)),
-                        "moq": moq_v,
-                        "plt_pack_qty": max(1, lot_v)
+                        "plt_pack_qty": max(1, lot_v),
+                        "moq": moq_v
                     }
             save_country_db(st.session_state.country_db)
             st.success("일괄 저장 완료!")
@@ -343,78 +345,87 @@ with col2:
 
 st.markdown("---")
 
-# --- 3구역: 발주 단위 (MOQ / PLT 포장 수량) 및 최종 산출 ---
-st.subheader("3. 협력사 납품 조건 및 발주량 산출")
+# --- 3구역: 협력사 납품 조건 (PLT 포장단위 우선 배치) ---
+st.subheader("3. 협력사 납품 조건 (포장단위 및 MOQ)")
 
+saved_plt_pack = saved_info.get("plt_pack_qty", 2350)  # 기본 추천 2,350
 saved_moq = saved_info.get("moq", 0)
-# 이전 버전 lot_size 호환
-saved_plt_pack = saved_info.get("plt_pack_qty", saved_info.get("lot_size", 1000))
 
-moq_col, lot_col = st.columns(2)
-with moq_col:
-    moq = st.number_input("최소 발주 수량 (MOQ)", min_value=0, value=saved_moq, step=100, key=f"moq_{input_part_no}")
+lot_col, moq_col = st.columns(2)
 with lot_col:
     plt_pack_qty = st.number_input(
-        "파레트(PLT)당 포장 수량", 
+        "⭐ 파레트(PLT)당 포장 수량 (EA / PLT)", 
         min_value=1, 
         value=max(1, saved_plt_pack), 
-        step=100, 
+        step=50, 
         key=f"plt_pack_{input_part_no}",
-        help="1 파레트에 적재되는 낱개 수량을 입력하세요. (예: 1,000 입력 시 1,000개 단위로 발주 올림 처리)"
+        help="1개 파레트에 실리는 낱개 수량입니다. (예: 2,350 입력 시 2,350개 단위로 올림하여 PLT 발주량 산출)"
+    )
+with moq_col:
+    moq = st.number_input(
+        "최소 발주 수량 (MOQ)", 
+        min_value=0, 
+        value=saved_moq, 
+        step=100, 
+        key=f"moq_{input_part_no}",
+        help="협력사 최소 발주 단위(EA). 없으면 0으로 두셔도 무방합니다."
     )
 
 if input_part_no:
-    if st.button("💾 이 품목의 기준 정보(국가/MOQ/파레트포장수량) 영구 저장"):
+    if st.button("💾 이 품목의 기준 정보(조달국가/PLT포장수량/MOQ) 영구 기억하기"):
         st.session_state.country_db[input_part_no] = {
             "country": pure_cname,
             "safety_days": safety_days,
-            "moq": moq,
-            "plt_pack_qty": plt_pack_qty
+            "plt_pack_qty": plt_pack_qty,
+            "moq": moq
         }
         save_country_db(st.session_state.country_db)
-        st.success(f"[{input_part_no}] 기준 정보(국가: {pure_cname}, MOQ: {moq:,}, PLT포장: {plt_pack_qty:,} EA) 영구 저장 완료!")
+        st.success(f"[{input_part_no}] 기준 정보(국가: {pure_cname}, PLT포장: {plt_pack_qty:,} EA, MOQ: {moq:,} EA) 저장 완료!")
         st.rerun()
 
 st.write("")
 
+# --- 4구역: 최종 발주량 산출 결과 ---
 if st.button("🚀 최종 발주량 산출하기", type="primary", use_container_width=True):
     if not input_part_no:
         st.error("⚠️ 품번을 먼저 입력해주세요.")
     else:
-        final_order_qty, plt_count, pure_shortage = calculate_order_quantity(
+        final_order_ea, final_plt, exact_plt, pure_shortage, base_qty = calculate_order_logic(
             current_stock, production_plan, safety_stock, moq, plt_pack_qty
         )
         display_name = part_name if part_name else "품명 미지정"
         
         st.markdown(f"### 📋 산출 결과: `[{input_part_no}] {display_name}`")
         
-        res1, res2, res3, res4 = st.columns(4)
+        c1, c2, c3, c4 = st.columns(4)
         
-        with res1:
+        with c1:
             st.metric(label="설정 안전재고", value=f"{safety_stock:,} EA", help=f"{safety_days}일치 기준")
-        with res2:
+        with c2:
             st.metric(label="순수 부족 수량", value=f"{max(0, pure_shortage):,} EA")
-        with res3:
-            st.metric(label="적용 MOQ / PLT 포장단위", value=f"{moq:,} / {plt_pack_qty:,} EA")
-        with res4:
-            if final_order_qty > 0:
+        with c3:
+            st.metric(label="PLT 포장 규격", value=f"{plt_pack_qty:,} EA/PLT")
+        with c4:
+            # 실무 요청 완벽 반영: 최종 발주 수량은 EA이고 뱃지에 몇 PLT인지 표시
+            if final_order_ea > 0:
                 st.metric(
-                    label="최종 발주 권고 수량", 
-                    value=f"{final_order_qty:,} EA", 
-                    delta=f"{plt_count:,} PLT 발주"
+                    label="최종 권고 발주 수량", 
+                    value=f"{final_order_ea:,} EA", 
+                    delta=f"{final_plt:,} PLT 발주"
                 )
             else:
-                st.metric(label="최종 발주 권고 수량", value="0 EA", delta="발주 불필요")
+                st.metric(label="최종 권고 발주 수량", value="0 EA", delta="발주 불필요")
             
-        if final_order_qty == 0:
+        if final_order_ea == 0:
             st.info("💡 현재고가 충분하여 신규 발주가 필요하지 않습니다.")
         else:
-            diff = final_order_qty - pure_shortage
-            if plt_pack_qty == 1:
-                st.info(f"👉 **{final_order_qty:,} EA** 발주 권고 (파레트 포장 수량을 입력하시면 PLT 수량이 자동 계산됩니다.)")
-            else:
-                st.success(
-                    f"📦 **발주 권고 확정:** 순수 부족분 **{pure_shortage:,} EA** 기준, "
-                    f"파레트 포장 규격({plt_pack_qty:,} EA/PLT)으로 계산한 결과 **{final_order_qty:,} EA / {plt_count:,} PLT 발주**로 확정합니다."
-                    + (f" (파레트 올림 여유분: +{diff:,} EA)" if diff > 0 else "")
-                )
+            diff_ea = final_order_ea - pure_shortage
+            st.success(
+                f"""
+                ### 🎯 발주 결정 내용
+                * **순수 부족 수량**: **{pure_shortage:,} EA**
+                * **파레트 환산 계산**: {pure_shortage:,} EA ÷ {plt_pack_qty:,} EA = **{exact_plt:.2f} PLT**
+                * **포장 단위 올림 적용**: **{final_plt:,} PLT** (소수점 올림 처리)
+                * **👉 최종 발주 수량 확정**: {final_plt:,} PLT × {plt_pack_qty:,} EA = **{final_order_ea:,} EA** (여유분: +{diff_ea:,} EA)
+                """
+            )
