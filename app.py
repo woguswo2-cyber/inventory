@@ -28,38 +28,28 @@ def save_master_db(db):
 if "vendor_master" not in st.session_state:
     st.session_state.vendor_master = load_master_db()
 
-# 줄바꿈 깨짐 완벽 대응 ERP 단가 파서
-def parse_erp_vendor_paste_robust(text_data, forced_vendor="", default_country="중국", default_plt=1000, default_moq=0):
+# ERP 단가등록 화면 파서
+def parse_erp_vendor_paste_robust(text_data, forced_vendor="", default_country="인도", default_plt=1000, default_moq=0):
     if not text_data or not text_data.strip():
         return 0
         
     days = 30 if "인도" in default_country else (14 if "중국" in default_country else (90 if ("유럽" in default_country or "EU" in default_country.upper()) else 14))
-    
-    # 1. 탭, 개행, 다중 공백을 모두 단일 공백으로 치환 후 토큰화
     raw_clean = text_data.replace("\r", " ")
     tokens = [t.strip() for t in re.split(r"[\t\n\s]+", raw_clean) if t.strip()]
     
-    # 품번 패턴 (영문 1~3자 + 숫자/영문 혼합 6자리 이상: H0084301C01, EHA0007100, E0056748C01, THS0107800 등)
     part_pattern = re.compile(r"^[A-Z]{1,4}[0-9]{4,}[A-Z0-9]*$")
-    # 협력사 코드 패턴 (5자리 내외 숫자)
     vendor_code_pattern = re.compile(r"^\d{4,6}$")
-    
     found_items = []
     
     for i, token in enumerate(tokens):
         tok_upper = token.upper()
-        # 회사/사업장 코드(00100, 110 등) 및 일반 단어 제외
         if tok_upper in ["00100", "110", "100", "200", "A02", "IN42", "COMMUTATOR", "MAGNET"]:
             continue
             
         if part_pattern.match(tok_upper) and len(tok_upper) >= 7:
-            # 품번 발견
             p_code = tok_upper
-            
-            # 1) 품명 수집 (품번 바로 뒤에 나오는 영문/숫자/특수문자 단어들, 다음 품번이나 업체코드가 나오기 전까지)
             p_name_parts = []
             for next_tok in tokens[i+1:]:
-                # 단가나 날짜 형태(2026-04-01, 239.5900 등)를 만나면 품명 종료
                 if re.match(r"^\d{4}-\d{2}-\d{2}$", next_tok) or re.match(r"^\d+\.\d+$", next_tok):
                     break
                 if vendor_code_pattern.match(next_tok) or (part_pattern.match(next_tok.upper()) and len(next_tok) >= 7):
@@ -67,15 +57,13 @@ def parse_erp_vendor_paste_robust(text_data, forced_vendor="", default_country="
                 if next_tok in ["00100", "110", "IN42", "EA", "P", "S", "A02"]:
                     continue
                 p_name_parts.append(next_tok)
-                if len(p_name_parts) >= 5: # 품명이 너무 길어지는 것 방지
+                if len(p_name_parts) >= 5:
                     break
             p_name = " ".join(p_name_parts).strip()
             
-            # 2) 협력사명/코드 탐색 (품번 앞쪽 1~5개 토큰 역추적)
             v_code = ""
             v_name_parts = []
             lookback = tokens[max(0, i-6):i]
-            
             for prev_tok in reversed(lookback):
                 if prev_tok in ["00100", "110", "EA", "P", "S"]:
                     continue
@@ -83,10 +71,8 @@ def parse_erp_vendor_paste_robust(text_data, forced_vendor="", default_country="
                     v_code = prev_tok
                 elif not vendor_code_pattern.match(prev_tok) and not part_pattern.match(prev_tok.upper()):
                     v_name_parts.insert(0, prev_tok)
-                    
             v_name = " ".join(v_name_parts).strip()
             
-            # 최종 협력사 키 지정
             if forced_vendor.strip():
                 final_v = forced_vendor.strip()
             elif v_code and v_name:
@@ -107,7 +93,6 @@ def parse_erp_vendor_paste_robust(text_data, forced_vendor="", default_country="
     for v_key, p_no, p_nm in found_items:
         if v_key not in st.session_state.vendor_master:
             st.session_state.vendor_master[v_key] = {}
-            
         existing = st.session_state.vendor_master[v_key].get(p_no, {})
         st.session_state.vendor_master[v_key][p_no] = {
             "part_name": p_nm if p_nm else existing.get("part_name", ""),
@@ -121,11 +106,22 @@ def parse_erp_vendor_paste_robust(text_data, forced_vendor="", default_country="
     save_master_db(st.session_state.vendor_master)
     return added_count
 
-# 전산 재고/생산계획 파서
-def extract_code_and_qty(raw_text):
+# 숫자 정제 함수 (콤마/점 제거 및 정수 변환)
+def clean_int_val(val_str):
+    if not val_str:
+        return 0
+    s = str(val_str).replace(",", "").strip()
+    try:
+        f = float(s)
+        return int(round(f))
+    except Exception:
+        return 0
+
+# 1. 재고 전용 파서 (L열 재고수량 타겟팅)
+def parse_stock_text(raw_text):
     if not raw_text or not raw_text.strip():
         return {}
-    result = {}
+    res = {}
     lines = raw_text.strip().split("\n")
     for line in lines:
         if any(w in line for w in ["합계", "소계", "TOTAL", "Total"]):
@@ -133,34 +129,64 @@ def extract_code_and_qty(raw_text):
         tokens = [t.strip() for t in re.split(r"[\t, ]+", line) if t.strip()]
         if not tokens:
             continue
+        
         found_code = None
         code_idx = -1
-        for idx, token in enumerate(tokens):
-            clean_tok = token.replace("-", "").upper()
+        for idx, tok in enumerate(tokens):
+            clean_tok = tok.replace("-", "").upper()
             if re.match(r"^[A-Z]{1,4}[0-9]{4,}[A-Z0-9]*$", clean_tok) and len(clean_tok) >= 7:
-                found_code = token.upper()
+                found_code = clean_tok
                 code_idx = idx
                 break
         if not found_code:
             continue
             
-        found_qty = 0
+        qty = 0
+        # EA 바로 다음 컬럼이 재고수량
         ea_indices = [i for i, t in enumerate(tokens) if t.upper() == "EA"]
         if ea_indices and ea_indices[0] + 1 < len(tokens):
-            try:
-                found_qty = int(float(tokens[ea_indices[0] + 1].replace(",", "")))
-            except Exception:
-                pass
-        if found_qty == 0:
+            qty = clean_int_val(tokens[ea_indices[0] + 1])
+        else:
+            # EA가 없을 경우 코드 뒤쪽 첫 번째 유효 정수
             for t in tokens[code_idx+1:]:
-                try:
-                    val = float(t.replace(",", ""))
-                    found_qty = int(val)
+                if re.match(r"^-?\d+(\.\d+)?$", t.replace(",", "")):
+                    qty = clean_int_val(t)
                     break
-                except Exception:
-                    pass
-        result[found_code] = found_qty
-    return result
+        res[found_code] = qty
+    return res
+
+# 2. 생산계획 전용 파서 (O열 생산계획 타겟팅)
+def parse_plan_text(raw_text):
+    if not raw_text or not raw_text.strip():
+        return {}
+    res = {}
+    lines = raw_text.strip().split("\n")
+    for line in lines:
+        if any(w in line for w in ["합계", "소계", "TOTAL", "Total"]):
+            continue
+        tokens = [t.strip() for t in re.split(r"[\t, ]+", line) if t.strip()]
+        if not tokens:
+            continue
+        
+        found_code = None
+        for tok in tokens:
+            clean_tok = tok.replace("-", "").upper()
+            if re.match(r"^[A-Z]{1,4}[0-9]{4,}[A-Z0-9]*$", clean_tok) and len(clean_tok) >= 7:
+                found_code = clean_tok
+                break
+        if not found_code:
+            continue
+            
+        # 생산계획 엑셀의 경우 통째로 복사 시 맨 마지막 토큰이 '생산계획' 수량임
+        qty = 0
+        for t in reversed(tokens):
+            clean_num = t.replace(",", "")
+            # 단가/금액이 아닌 온전한 정수 형태의 생산계획치 탐색
+            if re.match(r"^\d+$", clean_num):
+                qty = int(clean_num)
+                break
+        res[found_code] = qty
+    return res
 
 st.set_page_config(page_title="협력사별 발주량 산출 시스템", layout="wide")
 st.title("🏭 협력사별 n+1월 일괄 발주량(P/O) 산출 시스템")
@@ -168,10 +194,8 @@ st.title("🏭 협력사별 n+1월 일괄 발주량(P/O) 산출 시스템")
 # --- 사이드바 ---
 st.sidebar.header("📋 협력사 마스터 관리")
 
-with st.sidebar.expander("📥 ERP 단가등록 화면 붙여넣기 (신규 등록)", expanded=True):
-    # 업체명 직접 지정 옵션 (오인식 방지용)
-    manual_v_name = st.text_input("업체명 직접 지정 (선택)", placeholder="예: 62595 GREAT WALL (비워두면 자동 인식)")
-    
+with st.sidebar.expander("📥 ERP 단가등록 화면 붙여넣기 (신규 등록)", expanded=False):
+    manual_v_name = st.text_input("업체명 직접 지정 (선택)", placeholder="예: 42065 HYOSEONG INDIA")
     erp_paste_text = st.text_area(
         "ERP 표 복사본 (Ctrl+V)",
         placeholder="ERP 화면에서 복사한 데이터를 그대로 붙여넣으세요.",
@@ -179,7 +203,7 @@ with st.sidebar.expander("📥 ERP 단가등록 화면 붙여넣기 (신규 등�
     )
     col_c1, col_c2 = st.columns(2)
     with col_c1:
-        reg_country = st.selectbox("기본 조달국", ["중국", "인도", "유럽", "국내"], index=0)
+        reg_country = st.selectbox("기본 조달국", ["인도", "중국", "유럽", "국내"], index=0)
     with col_c2:
         reg_plt = st.number_input("기본 PLT당 수량", value=1000, step=100)
         
@@ -194,7 +218,7 @@ with st.sidebar.expander("📥 ERP 단가등록 화면 붙여넣기 (신규 등�
             st.sidebar.success(f"총 {cnt}개 품목 등록 성공!")
             st.rerun()
         else:
-            st.sidebar.error("품목을 인식하지 못했습니다. ERP 표를 다시 확인해 주세요.")
+            st.sidebar.error("품목을 인식하지 못했습니다.")
 
 with st.sidebar.expander("✏️ 등록된 마스터 데이터 조회 및 직접 수정", expanded=True):
     master_vendors = list(st.session_state.vendor_master.keys())
@@ -207,8 +231,8 @@ with st.sidebar.expander("✏️ 등록된 마스터 데이터 조회 및 직접
             m_rows.append({
                 "품목코드": p_code,
                 "품목명": p_val.get("part_name", ""),
-                "조달국": p_val.get("country", "중국"),
-                "안전일수": p_val.get("safety_days", 14),
+                "조달국": p_val.get("country", "인도"),
+                "안전일수": p_val.get("safety_days", 30),
                 "PLT수량": p_val.get("plt_pack_qty", 1000),
                 "MOQ": p_val.get("moq", 0)
             })
@@ -222,7 +246,7 @@ with st.sidebar.expander("✏️ 등록된 마스터 데이터 조회 및 직접
             column_config={
                 "품목코드": st.column_config.TextColumn(disabled=True),
                 "품목명": st.column_config.TextColumn(),
-                "조달국": st.column_config.SelectboxColumn(options=["중국", "인도", "유럽", "국내"]),
+                "조달국": st.column_config.SelectboxColumn(options=["인도", "중국", "유럽", "국내"]),
                 "안전일수": st.column_config.NumberColumn(format="%d"),
                 "PLT수량": st.column_config.NumberColumn(format="%d"),
                 "MOQ": st.column_config.NumberColumn(format="%d"),
@@ -243,14 +267,14 @@ with st.sidebar.expander("✏️ 등록된 마스터 데이터 조회 및 직접
                     }
                 st.session_state.vendor_master[edit_v] = new_dict
                 save_master_db(st.session_state.vendor_master)
-                st.success(f"[{edit_v}] 마스터가 수정되어 영구 저장되었습니다!")
+                st.success(f"[{edit_v}] 마스터 영구 저장 완료!")
                 st.rerun()
                 
         with col_btn2:
             if st.button("🗑️ 이 업체 삭제", use_container_width=True):
                 del st.session_state.vendor_master[edit_v]
                 save_master_db(st.session_state.vendor_master)
-                st.warning(f"[{edit_v}] 데이터가 삭제되었습니다.")
+                st.warning(f"[{edit_v}] 삭제 완료")
                 st.rerun()
     else:
         st.caption("등록된 협력사가 없습니다.")
@@ -268,7 +292,7 @@ st.subheader("1️⃣ 발주 대상 협력사 선택")
 
 vendor_list = list(st.session_state.vendor_master.keys())
 if not vendor_list:
-    st.info("👈 좌측 사이드바에서 ERP 화면 데이터를 붙여넣어 협력사를 등록해 주세요.")
+    st.info("👈 좌측 사이드바에서 ERP 단가등록 화면 데이터를 복사/붙여넣기하여 협력사를 먼저 등록해 주세요.")
     st.stop()
 
 selected_vendor = st.selectbox("발주할 협력사 선택", vendor_list)
@@ -285,7 +309,7 @@ with col1:
     st.markdown("**📦 사외창고(10OSPP01) 현재고 데이터 복사/붙여넣기**")
     stock_paste = st.text_area(
         "재고 텍스트 (Ctrl+V)", 
-        placeholder="전산 재고조회 화면을 복사해서 붙여넣으세요.",
+        placeholder="전산 재고조회 화면(L열 재고수량 포함)을 복사해서 붙여넣으세요.",
         height=140,
         key=f"stock_{selected_vendor}"
     )
@@ -294,13 +318,13 @@ with col2:
     st.markdown("**📅 n+1월 생산 계획 데이터 복사/붙여넣기**")
     plan_paste = st.text_area(
         "생산계획 텍스트 (Ctrl+V)", 
-        placeholder="생산계획 화면 또는 엑셀을 복사해서 붙여넣으세요.",
+        placeholder="엑셀에서 품목코드와 맨 끝 '생산 계획(10000)' 열이 포함되게 복사해서 붙여넣으세요.",
         height=140,
         key=f"plan_{selected_vendor}"
     )
 
-stock_map = extract_code_and_qty(stock_paste)
-plan_map = extract_code_and_qty(plan_paste)
+stock_map = parse_stock_text(stock_paste)
+plan_map = parse_plan_text(plan_paste)
 
 st.markdown("---")
 
@@ -309,16 +333,17 @@ st.subheader(f"3️⃣ [{selected_vendor}] 품목별 발주 계산 그리드")
 
 rows = []
 for code, info in vendor_items.items():
-    cur_stock = stock_map.get(code, 0)
-    prod_plan = plan_map.get(code, 0)
-    safe_days = info.get("safety_days", 14)
+    clean_c = code.replace("-", "").upper()
+    cur_stock = stock_map.get(clean_c, stock_map.get(code, 0))
+    prod_plan = plan_map.get(clean_c, plan_map.get(code, 0))
+    safe_days = info.get("safety_days", 30)
     plt_size = info.get("plt_pack_qty", 1000)
     moq = info.get("moq", 0)
     
     rows.append({
         "품목코드": code,
         "품목명": info.get("part_name", ""),
-        "조달국": info.get("country", "중국"),
+        "조달국": info.get("country", "인도"),
         "현재고(EA)": cur_stock,
         "n+1월 생산소요량(EA)": prod_plan,
         "안전재고일수(일)": safe_days,
@@ -361,7 +386,7 @@ if st.button(f"🚀 [{selected_vendor}] n+1월 일괄 발주량 산출하기", t
         plt_size = max(1, int(row["PLT당 포장수량(EA)"]))
         moq = int(row["MOQ(EA)"])
         
-        # 안전재고 = (월 소요량 / 30) * 안전일수
+        # 안전재고 = (월소요량 / 30) * 안전일수
         daily_use = p_plan / 30.0
         safe_stock = int(math.ceil(daily_use * s_days))
         
