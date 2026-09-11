@@ -28,39 +28,31 @@ def save_master_db(db):
 if "vendor_master" not in st.session_state:
     st.session_state.vendor_master = load_master_db()
 
-# ERP 단가등록 그리드 전용 복사/붙여넣기 파서
+# ERP 단가등록 화면 파서
 def parse_erp_vendor_paste(text_data, default_country="중국", default_plt=1000, default_moq=0):
     if not text_data or not text_data.strip():
         return 0
-    
     lines = text_data.strip().split("\n")
     added_count = 0
-    
-    # 조달국 안전일수 매핑
     days = 30 if "인도" in default_country else (14 if "중국" in default_country else (90 if ("유럽" in default_country or "EU" in default_country.upper()) else 14))
 
     for line in lines:
         if not line.strip() or any(w in line for w in ["레코드", "회사", "사업단위", "합계"]):
             continue
-        
-        # 탭(\t) 또는 다중 공백으로 분리
         tokens = [t.strip() for t in line.split("\t") if t.strip()]
         if len(tokens) < 4:
             tokens = [t.strip() for t in re.split(r"\s{2,}", line) if t.strip()]
             
-        # ERP 구조 매칭: 공급자번호, 공급자명, 품번, 품명 탐색
         vendor_code = ""
         vendor_name = ""
         part_no = ""
         part_name = ""
         
         for idx, tok in enumerate(tokens):
-            # 품번 패턴 (알파벳으로 시작하고 7자리 이상인 코드: H0166505C01, E0056748C01, THS0168300 등)
             if re.match(r"^[A-Z][A-Z0-9]{6,}$", tok.replace("-", "").upper()):
                 part_no = tok.upper()
                 if idx + 1 < len(tokens):
                     part_name = tokens[idx + 1]
-                # 품번 앞쪽에 공급자번호/명 위치
                 if idx >= 2:
                     vendor_name = tokens[idx - 1]
                     vendor_code = tokens[idx - 2]
@@ -71,19 +63,16 @@ def parse_erp_vendor_paste(text_data, default_country="중국", default_plt=1000
         if not part_no:
             continue
             
-        # 업체 표기 통합 (예: "60015 ANHUI" 또는 "60015")
         if vendor_code and vendor_name and not vendor_code.isdigit():
-            # 위치 뒤바뀜 보정
             vendor_key = f"{vendor_name} {vendor_code}".strip()
         elif vendor_code:
             vendor_key = f"{vendor_code} {vendor_name}".strip()
         else:
-            vendor_key = "60015 ANHUI"
+            vendor_key = "등록 협력사"
             
         if vendor_key not in st.session_state.vendor_master:
             st.session_state.vendor_master[vendor_key] = {}
             
-        # 기존 저장된 데이터가 있으면 유지, 없으면 기본값 부여
         existing = st.session_state.vendor_master[vendor_key].get(part_no, {})
         st.session_state.vendor_master[vendor_key][part_no] = {
             "part_name": part_name if part_name else existing.get("part_name", ""),
@@ -97,7 +86,7 @@ def parse_erp_vendor_paste(text_data, default_country="중국", default_plt=1000
     save_master_db(st.session_state.vendor_master)
     return added_count
 
-# 전산 재고 및 생산계획 텍스트 파서
+# 전산 재고 및 계획 수량 추출기
 def extract_code_and_qty(raw_text):
     if not raw_text or not raw_text.strip():
         return {}
@@ -109,7 +98,6 @@ def extract_code_and_qty(raw_text):
         tokens = [t.strip() for t in re.split(r"[\t, ]+", line) if t.strip()]
         if not tokens:
             continue
-        
         found_code = None
         code_idx = -1
         for idx, token in enumerate(tokens):
@@ -142,47 +130,105 @@ def extract_code_and_qty(raw_text):
 st.set_page_config(page_title="협력사별 발주량 산출 시스템", layout="wide")
 st.title("🏭 협력사별 n+1월 일괄 발주량(P/O) 산출 시스템")
 
-# --- 사이드바: ERP 화면 통째 복사/붙여넣기 마스터 등록 ---
-st.sidebar.header("📋 협력사 마스터 ERP 간편 등록")
-st.sidebar.caption("ERP [품목별 공급자별 단가등록] 화면의 그리드를 드래그해서 그대로 붙여넣으세요.")
+# --- 사이드바 영역 ---
+st.sidebar.header("📋 협력사 마스터 관리")
 
-with st.sidebar.expander("📥 ERP 단가등록 화면 붙여넣기 (열 편집 불필요)", expanded=True):
+# 1. 마스터 일괄 붙여넣기 등록
+with st.sidebar.expander("📥 ERP 단가등록 화면 붙여넣기 (신규 등록)", expanded=False):
     erp_paste_text = st.text_area(
-        "ERP 표 전체 복사본 (Ctrl+C / Ctrl+V)",
-        placeholder="00100 110 60015 ANHUI H0166505C01 50TQ MAGNET ...\n00100 110 60015 ANHUI H0166537C00 T50 MAGNET ...",
-        height=180
+        "ERP 표 복사본 (Ctrl+V)",
+        placeholder="ERP 화면에서 마우스로 복사한 표 데이터를 그대로 붙여넣으세요.",
+        height=140
     )
-    
     col_c1, col_c2 = st.columns(2)
     with col_c1:
-        reg_country = st.selectbox("기본 조달국", ["중국", "인도", "유럽", "국내"], index=0)
+        reg_country = st.selectbox("기본 조달국", ["인도", "중국", "유럽", "국내"], index=0)
     with col_c2:
         reg_plt = st.number_input("기본 PLT당 수량", value=1000, step=100)
         
-    if st.sidebar.button("💾 위 ERP 데이터로 마스터 등록/추가", type="primary", use_container_width=True):
+    if st.button("💾 위 ERP 데이터로 마스터 등록/추가", type="primary", use_container_width=True):
         cnt = parse_erp_vendor_paste(erp_paste_text, default_country=reg_country, default_plt=reg_plt)
         if cnt > 0:
-            st.sidebar.success(f"🎉 총 {cnt}개 품목이 협력사 마스터로 완벽 연동되었습니다!")
+            st.sidebar.success(f"총 {cnt}개 품목 등록 성공!")
             st.rerun()
         else:
-            st.sidebar.error("데이터를 인식하지 못했습니다. ERP 표 데이터를 다시 긁어서 붙여넣어 주세요.")
+            st.sidebar.error("데이터 인식 실패. ERP 표를 다시 긁어주세요.")
 
-# 마스터 초기화 버튼 (필요시)
-with st.sidebar.expander("⚙️ 마스터 관리 / 초기화"):
-    st.write(f"현재 등록된 협력사: **{len(st.session_state.vendor_master)}개**")
-    if st.button("🗑️ 마스터 전체 초기화"):
+# 2. 마스터 직접 수정/편집 에디터 (신설)
+with st.sidebar.expander("✏️ 등록된 마스터 데이터 조회 및 직접 수정", expanded=True):
+    master_vendors = list(st.session_state.vendor_master.keys())
+    if master_vendors:
+        edit_v = st.selectbox("수정할 협력사 선택", master_vendors, key="edit_vendor_sel")
+        v_items = st.session_state.vendor_master.get(edit_v, {})
+        
+        # 편집용 데이터프레임 생성
+        m_rows = []
+        for p_code, p_val in v_items.items():
+            m_rows.append({
+                "품목코드": p_code,
+                "품목명": p_val.get("part_name", ""),
+                "조달국": p_val.get("country", "인도"),
+                "안전일수": p_val.get("safety_days", 30),
+                "PLT수량": p_val.get("plt_pack_qty", 1000),
+                "MOQ": p_val.get("moq", 0)
+            })
+        df_m_edit = pd.DataFrame(m_rows)
+        
+        st.caption("👇 표 안의 숫자를 더블클릭해서 수정한 뒤 아래 저장 버튼을 누르세요.")
+        edited_m_df = st.data_editor(
+            df_m_edit,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "품목코드": st.column_config.TextColumn(disabled=True),
+                "품목명": st.column_config.TextColumn(),
+                "조달국": st.column_config.SelectboxColumn(options=["인도", "중국", "유럽", "국내"]),
+                "안전일수": st.column_config.NumberColumn(format="%d"),
+                "PLT수량": st.column_config.NumberColumn(format="%d"),
+                "MOQ": st.column_config.NumberColumn(format="%d"),
+            }
+        )
+        
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            if st.button("💾 변경사항 영구 저장", type="primary", use_container_width=True):
+                new_dict = {}
+                for _, r in edited_m_df.iterrows():
+                    new_dict[r["품목코드"]] = {
+                        "part_name": r["품목명"],
+                        "country": r["조달국"],
+                        "safety_days": int(r["안전일수"]),
+                        "plt_pack_qty": max(1, int(r["PLT수량"])),
+                        "moq": int(r["MOQ"])
+                    }
+                st.session_state.vendor_master[edit_v] = new_dict
+                save_master_db(st.session_state.vendor_master)
+                st.success(f"[{edit_v}] 마스터가 수정되어 영구 저장되었습니다!")
+                st.rerun()
+                
+        with col_btn2:
+            if st.button("🗑️ 이 업체 삭제", use_container_width=True):
+                del st.session_state.vendor_master[edit_v]
+                save_master_db(st.session_state.vendor_master)
+                st.warning(f"[{edit_v}] 데이터가 삭제되었습니다.")
+                st.rerun()
+    else:
+        st.caption("등록된 협력사가 없습니다.")
+
+with st.sidebar.expander("⚙️ 전체 데이터 초기화"):
+    if st.button("⚠️ 모든 협력사 마스터 삭제 (완전 초기화)"):
         st.session_state.vendor_master = {}
         save_master_db({})
         st.rerun()
 
 st.markdown("---")
 
-# --- 1단계: 업체 선택 ---
+# --- 메인 화면 1단계: 업체 선택 ---
 st.subheader("1️⃣ 발주 대상 협력사 선택")
 
 vendor_list = list(st.session_state.vendor_master.keys())
 if not vendor_list:
-    st.info("👈 좌측 사이드바에 올려주신 ERP 캡처본 데이터를 드래그 복사해서 붙여넣고 [마스터 등록] 버튼을 눌러주세요.")
+    st.info("👈 좌측 사이드바에서 ERP 단가등록 화면 데이터를 복사/붙여넣기하여 협력사를 등록해 주세요.")
     st.stop()
 
 selected_vendor = st.selectbox("발주할 협력사 선택", vendor_list)
@@ -192,24 +238,22 @@ st.info(f"선택 협력사: **{selected_vendor}** | 등록된 관리 품목: **�
 
 st.markdown("---")
 
-# --- 2단계: 재고 및 생산계획 붙여넣기 ---
+# --- 메인 화면 2단계: 재고 및 생산계획 붙여넣기 ---
 st.subheader("2️⃣ 재고 현황 및 n+1월 생산계획 붙여넣기")
-st.caption("사내 전산 재고와 생산계획 데이터를 아래 상자에 각각 복사/붙여넣기하세요.")
-
 col1, col2 = st.columns(2)
 with col1:
-    st.markdown("**📦 사외창고(10OSPP01) 현재고 데이터 (Ctrl+V)**")
+    st.markdown("**📦 사외창고(10OSPP01) 현재고 데이터 복사/붙여넣기**")
     stock_paste = st.text_area(
-        "재고 텍스트", 
+        "재고 텍스트 (Ctrl+V)", 
         placeholder="전산 재고조회 화면을 복사해서 붙여넣으세요.",
         height=140,
         key=f"stock_{selected_vendor}"
     )
 
 with col2:
-    st.markdown("**📅 n+1월 생산 계획 데이터 (Ctrl+V)**")
+    st.markdown("**📅 n+1월 생산 계획 데이터 복사/붙여넣기**")
     plan_paste = st.text_area(
-        "생산계획 텍스트", 
+        "생산계획 텍스트 (Ctrl+V)", 
         placeholder="생산계획 화면 또는 엑셀을 복사해서 붙여넣으세요.",
         height=140,
         key=f"plan_{selected_vendor}"
@@ -220,21 +264,21 @@ plan_map = extract_code_and_qty(plan_paste)
 
 st.markdown("---")
 
-# --- 3단계: 품목별 계산 그리드 (PLT단위/MOQ 자유 수정 가능) ---
+# --- 메인 화면 3단계: 품목별 계산 그리드 ---
 st.subheader(f"3️⃣ [{selected_vendor}] 품목별 발주 계산 그리드")
 
 rows = []
 for code, info in vendor_items.items():
     cur_stock = stock_map.get(code, 0)
     prod_plan = plan_map.get(code, 0)
-    safe_days = info.get("safety_days", 14)
+    safe_days = info.get("safety_days", 30)
     plt_size = info.get("plt_pack_qty", 1000)
     moq = info.get("moq", 0)
     
     rows.append({
         "품목코드": code,
         "품목명": info.get("part_name", ""),
-        "조달국": info.get("country", "중국"),
+        "조달국": info.get("country", "인도"),
         "현재고(EA)": cur_stock,
         "n+1월 생산소요량(EA)": prod_plan,
         "안전재고일수(일)": safe_days,
@@ -244,7 +288,7 @@ for code, info in vendor_items.items():
 
 df_editable = pd.DataFrame(rows)
 
-st.caption("💡 각 품목의 [PLT당 포장수량]이나 [MOQ]는 표 안에서 더블클릭하여 바로 수정할 수 있습니다.")
+st.caption("💡 각 품목의 [현재고], [생산소요량], [PLT당 포장수량]은 표 안에서 더블클릭하여 바로 수정 가능합니다.")
 edited_df = st.data_editor(
     df_editable,
     use_container_width=True,
@@ -263,7 +307,7 @@ edited_df = st.data_editor(
 
 st.write("")
 
-# --- 4단계: 최종 발주량 산출 ---
+# --- 메인 화면 4단계: 일괄 산출 ---
 if st.button(f"🚀 [{selected_vendor}] n+1월 일괄 발주량 산출하기", type="primary", use_container_width=True):
     result_rows = []
     total_order_ea = 0
@@ -277,7 +321,7 @@ if st.button(f"🚀 [{selected_vendor}] n+1월 일괄 발주량 산출하기", t
         plt_size = max(1, int(row["PLT당 포장수량(EA)"]))
         moq = int(row["MOQ(EA)"])
         
-        # 안전재고 수량 = (월소요량 / 30) * 안전일수
+        # 안전재고: (월 소요량 / 30) * 안전일수
         daily_use = p_plan / 30.0
         safe_stock = int(math.ceil(daily_use * s_days))
         
