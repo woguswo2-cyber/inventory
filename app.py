@@ -28,86 +28,100 @@ def save_master_db(db):
 if "vendor_master" not in st.session_state:
     st.session_state.vendor_master = load_master_db()
 
-# ERP 단가등록 화면 파서 (업체명 띄어쓰기 완벽 대응)
-def parse_erp_vendor_paste(text_data, default_country="중국", default_plt=1000, default_moq=0):
+# 줄바꿈 깨짐 완벽 대응 ERP 단가 파서
+def parse_erp_vendor_paste_robust(text_data, forced_vendor="", default_country="중국", default_plt=1000, default_moq=0):
     if not text_data or not text_data.strip():
         return 0
-    lines = text_data.strip().split("\n")
-    added_count = 0
+        
     days = 30 if "인도" in default_country else (14 if "중국" in default_country else (90 if ("유럽" in default_country or "EU" in default_country.upper()) else 14))
-
-    for line in lines:
-        if not line.strip() or any(w in line for w in ["레코드", "회사", "사업단위", "합계"]):
-            continue
-        
-        # 1차 탭 분리 시도
-        tokens = [t.strip() for t in line.split("\t") if t.strip()]
-        # 탭이 깨져서 공백으로 붙여넣어졌을 경우 대비
-        if len(tokens) < 4:
-            tokens = [t.strip() for t in re.split(r"\s+", line) if t.strip()]
-            
-        part_no = ""
-        part_name = ""
-        part_idx = -1
-        
-        # 품번 탐색 (영문 1자 + 영문/숫자 6자리 이상 조합: H0080650C03, E0056748C01 등)
-        for idx, tok in enumerate(tokens):
-            clean_tok = tok.replace("-", "").upper()
-            if re.match(r"^[A-Z][A-Z0-9]{6,}$", clean_tok):
-                part_no = tok.upper()
-                part_idx = idx
-                if idx + 1 < len(tokens):
-                    part_name = tokens[idx + 1]
-                break
-                
-        if not part_no or part_idx == -1:
+    
+    # 1. 탭, 개행, 다중 공백을 모두 단일 공백으로 치환 후 토큰화
+    raw_clean = text_data.replace("\r", " ")
+    tokens = [t.strip() for t in re.split(r"[\t\n\s]+", raw_clean) if t.strip()]
+    
+    # 품번 패턴 (영문 1~3자 + 숫자/영문 혼합 6자리 이상: H0084301C01, EHA0007100, E0056748C01, THS0107800 등)
+    part_pattern = re.compile(r"^[A-Z]{1,4}[0-9]{4,}[A-Z0-9]*$")
+    # 협력사 코드 패턴 (5자리 내외 숫자)
+    vendor_code_pattern = re.compile(r"^\d{4,6}$")
+    
+    found_items = []
+    
+    for i, token in enumerate(tokens):
+        tok_upper = token.upper()
+        # 회사/사업장 코드(00100, 110 등) 및 일반 단어 제외
+        if tok_upper in ["00100", "110", "100", "200", "A02", "IN42", "COMMUTATOR", "MAGNET"]:
             continue
             
-        # 품번 앞부분 토큰들 분석하여 [공급자코드] 및 [공급자명] 추출
-        pre_tokens = tokens[:part_idx]
-        
-        # 00100(회사), 110(사업단위) 등 앞쪽 시스템 코드 제외
-        pre_tokens = [t for t in pre_tokens if t not in ["00100", "110", "100", "200"]]
-        
-        vendor_code = ""
-        vendor_name_parts = []
-        
-        for t in pre_tokens:
-            # 5자리 협력사 번호 식별 (예: 62595, 62643, 42065, 60015)
-            if re.match(r"^\d{4,6}$", t) and not vendor_code:
-                vendor_code = t
+        if part_pattern.match(tok_upper) and len(tok_upper) >= 7:
+            # 품번 발견
+            p_code = tok_upper
+            
+            # 1) 품명 수집 (품번 바로 뒤에 나오는 영문/숫자/특수문자 단어들, 다음 품번이나 업체코드가 나오기 전까지)
+            p_name_parts = []
+            for next_tok in tokens[i+1:]:
+                # 단가나 날짜 형태(2026-04-01, 239.5900 등)를 만나면 품명 종료
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", next_tok) or re.match(r"^\d+\.\d+$", next_tok):
+                    break
+                if vendor_code_pattern.match(next_tok) or (part_pattern.match(next_tok.upper()) and len(next_tok) >= 7):
+                    break
+                if next_tok in ["00100", "110", "IN42", "EA", "P", "S", "A02"]:
+                    continue
+                p_name_parts.append(next_tok)
+                if len(p_name_parts) >= 5: # 품명이 너무 길어지는 것 방지
+                    break
+            p_name = " ".join(p_name_parts).strip()
+            
+            # 2) 협력사명/코드 탐색 (품번 앞쪽 1~5개 토큰 역추적)
+            v_code = ""
+            v_name_parts = []
+            lookback = tokens[max(0, i-6):i]
+            
+            for prev_tok in reversed(lookback):
+                if prev_tok in ["00100", "110", "EA", "P", "S"]:
+                    continue
+                if vendor_code_pattern.match(prev_tok) and not v_code:
+                    v_code = prev_tok
+                elif not vendor_code_pattern.match(prev_tok) and not part_pattern.match(prev_tok.upper()):
+                    v_name_parts.insert(0, prev_tok)
+                    
+            v_name = " ".join(v_name_parts).strip()
+            
+            # 최종 협력사 키 지정
+            if forced_vendor.strip():
+                final_v = forced_vendor.strip()
+            elif v_code and v_name:
+                final_v = f"{v_code} {v_name}"
+            elif v_code:
+                final_v = v_code
+            elif v_name:
+                final_v = v_name
             else:
-                vendor_name_parts.append(t)
+                final_v = "기타 협력사"
                 
-        vendor_name = " ".join(vendor_name_parts).strip()
-        
-        # 업체명 완성 (예: "62595 GREAT WALL", "62643 ZEB")
-        if vendor_code and vendor_name:
-            vendor_key = f"{vendor_code} {vendor_name}"
-        elif vendor_code:
-            vendor_key = vendor_code
-        elif vendor_name:
-            vendor_key = vendor_name
-        else:
-            vendor_key = "미지정 협력사"
+            found_items.append((final_v, p_code, p_name))
+
+    if not found_items:
+        return 0
+
+    added_count = 0
+    for v_key, p_no, p_nm in found_items:
+        if v_key not in st.session_state.vendor_master:
+            st.session_state.vendor_master[v_key] = {}
             
-        if vendor_key not in st.session_state.vendor_master:
-            st.session_state.vendor_master[vendor_key] = {}
-            
-        existing = st.session_state.vendor_master[vendor_key].get(part_no, {})
-        st.session_state.vendor_master[vendor_key][part_no] = {
-            "part_name": part_name if part_name else existing.get("part_name", ""),
+        existing = st.session_state.vendor_master[v_key].get(p_no, {})
+        st.session_state.vendor_master[v_key][p_no] = {
+            "part_name": p_nm if p_nm else existing.get("part_name", ""),
             "country": existing.get("country", default_country),
             "safety_days": existing.get("safety_days", days),
             "plt_pack_qty": existing.get("plt_pack_qty", default_plt),
             "moq": existing.get("moq", default_moq)
         }
         added_count += 1
-        
+
     save_master_db(st.session_state.vendor_master)
     return added_count
 
-# 전산 재고 및 계획 수량 추출기
+# 전산 재고/생산계획 파서
 def extract_code_and_qty(raw_text):
     if not raw_text or not raw_text.strip():
         return {}
@@ -123,7 +137,7 @@ def extract_code_and_qty(raw_text):
         code_idx = -1
         for idx, token in enumerate(tokens):
             clean_tok = token.replace("-", "").upper()
-            if re.match(r"^[A-Z][A-Z0-9]{5,}$", clean_tok):
+            if re.match(r"^[A-Z]{1,4}[0-9]{4,}[A-Z0-9]*$", clean_tok) and len(clean_tok) >= 7:
                 found_code = token.upper()
                 code_idx = idx
                 break
@@ -154,10 +168,13 @@ st.title("🏭 협력사별 n+1월 일괄 발주량(P/O) 산출 시스템")
 # --- 사이드바 ---
 st.sidebar.header("📋 협력사 마스터 관리")
 
-with st.sidebar.expander("📥 ERP 단가등록 화면 붙여넣기 (신규 등록)", expanded=False):
+with st.sidebar.expander("📥 ERP 단가등록 화면 붙여넣기 (신규 등록)", expanded=True):
+    # 업체명 직접 지정 옵션 (오인식 방지용)
+    manual_v_name = st.text_input("업체명 직접 지정 (선택)", placeholder="예: 62595 GREAT WALL (비워두면 자동 인식)")
+    
     erp_paste_text = st.text_area(
         "ERP 표 복사본 (Ctrl+V)",
-        placeholder="ERP 화면에서 마우스로 복사한 표 데이터를 그대로 붙여넣으세요.",
+        placeholder="ERP 화면에서 복사한 데이터를 그대로 붙여넣으세요.",
         height=140
     )
     col_c1, col_c2 = st.columns(2)
@@ -167,12 +184,17 @@ with st.sidebar.expander("📥 ERP 단가등록 화면 붙여넣기 (신규 등�
         reg_plt = st.number_input("기본 PLT당 수량", value=1000, step=100)
         
     if st.button("💾 위 ERP 데이터로 마스터 등록/추가", type="primary", use_container_width=True):
-        cnt = parse_erp_vendor_paste(erp_paste_text, default_country=reg_country, default_plt=reg_plt)
+        cnt = parse_erp_vendor_paste_robust(
+            erp_paste_text, 
+            forced_vendor=manual_v_name, 
+            default_country=reg_country, 
+            default_plt=reg_plt
+        )
         if cnt > 0:
             st.sidebar.success(f"총 {cnt}개 품목 등록 성공!")
             st.rerun()
         else:
-            st.sidebar.error("데이터 인식 실패. ERP 표를 다시 확인해 주세요.")
+            st.sidebar.error("품목을 인식하지 못했습니다. ERP 표를 다시 확인해 주세요.")
 
 with st.sidebar.expander("✏️ 등록된 마스터 데이터 조회 및 직접 수정", expanded=True):
     master_vendors = list(st.session_state.vendor_master.keys())
@@ -221,14 +243,14 @@ with st.sidebar.expander("✏️ 등록된 마스터 데이터 조회 및 직접
                     }
                 st.session_state.vendor_master[edit_v] = new_dict
                 save_master_db(st.session_state.vendor_master)
-                st.success(f"[{edit_v}] 저장 완료!")
+                st.success(f"[{edit_v}] 마스터가 수정되어 영구 저장되었습니다!")
                 st.rerun()
                 
         with col_btn2:
             if st.button("🗑️ 이 업체 삭제", use_container_width=True):
                 del st.session_state.vendor_master[edit_v]
                 save_master_db(st.session_state.vendor_master)
-                st.warning(f"[{edit_v}] 삭제 완료")
+                st.warning(f"[{edit_v}] 데이터가 삭제되었습니다.")
                 st.rerun()
     else:
         st.caption("등록된 협력사가 없습니다.")
@@ -339,7 +361,7 @@ if st.button(f"🚀 [{selected_vendor}] n+1월 일괄 발주량 산출하기", t
         plt_size = max(1, int(row["PLT당 포장수량(EA)"]))
         moq = int(row["MOQ(EA)"])
         
-        # 안전재고: (월 소요량 / 30) * 안전일수
+        # 안전재고 = (월 소요량 / 30) * 안전일수
         daily_use = p_plan / 30.0
         safe_stock = int(math.ceil(daily_use * s_days))
         
